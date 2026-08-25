@@ -1,0 +1,82 @@
+git-whoami(1)
+=============
+
+NAME
+----
+git-whoami - Show current user identity and commit signing information
+
+
+SYNOPSIS
+--------
+[synopsis]
+git whoami [options]
+
+DESCRIPTION
+-----------
+Displays the author and committer identity (name and email address) and
+commit signing configuration that will be used when signing and recording
+Git commits.
+
+By default, prints a human-readable summary of the author, committer, and
+signing status. Single-field options (`--author`, `--committer`, `--name`,
+`--email`, `--signing-key`) and `--porcelain` print raw, machine-readable
+values suitable for scripts and automation, exiting with status 1 if a
+requested variable is not set.
+
+OPTIONS
+-------
+`-a`::
+`--author`::
+	Show the author identity (`Name <email>`).
+
+`-c`::
+`--committer`::
+	Show the committer identity (`Name <email>`).
+
+`-n`::
+`--name`::
+	Show name only. When used with `--author` or `--committer`,
+	shows the corresponding name; otherwise defaults to the committer name.
+
+`-e`::
+`--email`::
+	Show email address only. When used with `--author` or `--committer`,
+	shows the corresponding email; otherwise defaults to the committer email.
+
+`-s`::
+`--signing-key`::
+	Show the signing key that Git would resolve for signing commits.
+	Resolution proceeds in the following order:
+	* The explicitly configured `user.signingKey`, if set.
+	* If `gpg.format` is set to `ssh` and `gpg.ssh.defaultKeyCommand`
+	  is configured, executes the command to obtain the public key.
+	* If `gpg.format` is `openpgp` or `x509` and `commit.gpgsign` is
+	  enabled, falls back to the committer identity.
+	* If signing is disabled (`commit.gpgsign=false`) and no explicit key
+	  is configured, exits with status 1.
+
+`--porcelain`::
+	Give the output in an easy-to-parse format for scripts.
+	Outputs key-value pairs (`user.author.name`, `user.author.email`,
+	`user.committer.name`, `user.committer.email`, `user.signingkey`,
+	`gpg.format`, `commit.gpgsign`).
+
+`-z`::
+`--null`::
+	Terminate output lines or entries with NUL instead of a newline.
+	Useful for scripts and machine parsing.
+
+`-v`::
+`--verbose`::
+	Show detailed, human-readable identity and signing status breakdown.
+
+OUTPUT STABILITY
+----------------
+The `--porcelain` format and single-field selectors (`-a`, `-c`, `-n`, `-e`, `-s`)
+produce stable, machine-readable output suitable for scripting.
+The default multi-line summary and `-v` / `--verbose` displays are human-oriented
+and their formatting may evolve over time.
+
+GIT
+---
+Part of the linkgit:git[1] suite
