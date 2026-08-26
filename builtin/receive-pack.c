@@ -1004,6 +1004,41 @@ static int run_update_hook(struct command *cmd)
 	return code;
 }
 
+static int run_receive_report_hook(struct strbuf *report)
+{
+	struct child_process proc = CHILD_PROCESS_INIT;
+	struct async sideband_async;
+	int sideband_async_started = 0;
+	int saved_stderr = -1;
+	struct strbuf out = STRBUF_INIT;
+	const char *hook_path;
+	int ret;
+
+	hook_path = find_hook(the_repository, "receive-report");
+	if (!hook_path)
+		return 0;
+
+	strvec_push(&proc.args, hook_path);
+	proc.trace2_hook_name = "receive-report";
+
+	prepare_sideband_async(&sideband_async, &saved_stderr,
+			       &sideband_async_started);
+
+	sigchain_push(SIGPIPE, SIG_IGN);
+	ret = pipe_command(&proc, report->buf, report->len, &out,
+			   report->len, NULL, 0);
+	sigchain_pop(SIGPIPE);
+
+	finish_sideband_async(&sideband_async, saved_stderr,
+			      sideband_async_started);
+
+	if (!ret)
+		strbuf_swap(&out, report);
+
+	strbuf_release(&out);
+	return ret;
+}
+
 static struct command *find_command_by_refname(struct command *list,
 					       const char *refname)
 {
@@ -2534,9 +2569,12 @@ static void update_shallow_info(struct command *commands,
  * Generate the response to be sent to the client invoking 'git-receive-pack(1)'.
  * For v2 protocol, set `add_reports` to true, which will also add additional
  * report per reference update.
+ * If `ref_error` is set, then all references will be rejected with the given
+ * error message.
  */
 static void generate_response(struct strbuf *buf, struct command *commands,
-			      const char *unpack_status, bool add_reports)
+			      const char *unpack_status, bool add_reports,
+			      const char *ref_error)
 {
 	struct command *cmd;
 
@@ -2550,10 +2588,13 @@ static void generate_response(struct strbuf *buf, struct command *commands,
 		if (cmd->error_string)
 			packet_buf_write(buf, "ng %s %s\n",
 					 cmd->ref_name, cmd->error_string);
+		else if (ref_error)
+			packet_buf_write(buf, "ng %s %s\n",
+					 cmd->ref_name, ref_error);
 		else
 			packet_buf_write(buf, "ok %s\n", cmd->ref_name);
 
-		if (!add_reports || cmd->error_string)
+		if (!add_reports || cmd->error_string || ref_error)
 			continue;
 
 		for (report = cmd->report; report; report = report->next) {
@@ -2581,7 +2622,13 @@ static void report(struct command *commands, const char *unpack_status)
 {
 	struct strbuf buf = STRBUF_INIT;
 
-	generate_response(&buf, commands, unpack_status, false);
+	generate_response(&buf, commands, unpack_status, false, NULL);
+
+	if (run_receive_report_hook(&buf)) {
+		strbuf_reset(&buf);
+		generate_response(&buf, commands, unpack_status, false,
+				  "receive-report hook failed");
+	}
 
 	if (use_sideband)
 		send_sideband(1, 1, buf.buf, buf.len, use_sideband);
@@ -2594,7 +2641,13 @@ static void report_v2(struct command *commands, const char *unpack_status)
 {
 	struct strbuf buf = STRBUF_INIT;
 
-	generate_response(&buf, commands, unpack_status, true);
+	generate_response(&buf, commands, unpack_status, true, NULL);
+
+	if (run_receive_report_hook(&buf)) {
+		strbuf_reset(&buf);
+		generate_response(&buf, commands, unpack_status, true,
+			  "receive-report hook failed");
+	}
 
 	if (use_sideband)
 		send_sideband(1, 1, buf.buf, buf.len, use_sideband);
