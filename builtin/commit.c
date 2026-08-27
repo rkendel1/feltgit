@@ -515,13 +515,21 @@ static const char *prepare_index(const char **argv, const char *prefix,
 	 */
 	commit_style = COMMIT_PARTIAL;
 
-	if (whence != FROM_COMMIT) {
-		if (whence == FROM_MERGE)
-			die(_("cannot do a partial commit during a merge."));
-		else if (is_from_cherry_pick(whence))
-			die(_("cannot do a partial commit during a cherry-pick."));
-		else if (is_from_rebase(whence))
-			die(_("cannot do a partial commit during a rebase."));
+	switch (sequencer_ongoing_operation(the_repository, whence)) {
+	case ONGOING_NONE:
+		break;
+	case ONGOING_MERGE:
+		die(_("cannot do a partial commit during a merge."));
+	case ONGOING_CHERRY_PICK:
+		die(_("cannot do a partial commit during a cherry-pick."));
+	case ONGOING_REBASE_EMPTY:
+		die(_("cannot do a partial commit while resolving a commit that became empty."));
+	case ONGOING_REVERT:
+		die(_("cannot do a partial commit during a revert."));
+	case ONGOING_AM:
+		die(_("cannot do a partial commit during an am session."));
+	case ONGOING_REBASE_CONFLICT:
+		die(_("cannot do a partial commit while resolving conflicts during a rebase."));
 	}
 
 	if (list_paths(&partial, !current_head ? NULL : "HEAD", &pathspec))
@@ -1326,15 +1334,30 @@ static int parse_and_validate_options(int argc, const char *argv[],
 		use_editor = 0;
 
 	/* Sanity check options */
-	if (amend && !current_head)
-		die(_("You have nothing to amend."));
-	if (amend && whence != FROM_COMMIT) {
-		if (whence == FROM_MERGE)
+	if (amend) {
+		if (!current_head)
+			die(_("You have nothing to amend."));
+		/*
+		 * Refuse to amend in the middle of any operation that is
+		 * meant to record its result as a new commit on top of HEAD
+		 * rather than by rewriting HEAD.
+		 */
+		switch (sequencer_ongoing_operation(s->repo, whence)) {
+		case ONGOING_NONE:
+			break;
+		case ONGOING_MERGE:
 			die(_("You are in the middle of a merge -- cannot amend."));
-		else if (is_from_cherry_pick(whence))
+		case ONGOING_CHERRY_PICK:
 			die(_("You are in the middle of a cherry-pick -- cannot amend."));
-		else if (whence == FROM_REBASE_PICK)
-			die(_("You are in the middle of a rebase -- cannot amend."));
+		case ONGOING_REBASE_EMPTY:
+			die(_("You are resolving a commit that became empty -- cannot amend."));
+		case ONGOING_REVERT:
+			die(_("You are in the middle of a revert -- cannot amend."));
+		case ONGOING_AM:
+			die(_("You are in the middle of an am session -- cannot amend."));
+		case ONGOING_REBASE_CONFLICT:
+			die(_("You are resolving conflicts during a rebase -- cannot amend."));
+		}
 	}
 	if (fixup_message && squash_message)
 		die(_("options '%s' and '%s' cannot be used together"), "--squash", "--fixup");
