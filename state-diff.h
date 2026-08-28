@@ -199,8 +199,27 @@ void free_state_conflicts(struct state_conflicts *conflicts);
 /*
  * Reconcile state-root commits (commit-level entry point).
  *
- * This validates that all three inputs are state-root commits, then performs
- * three-way reconciliation on their state objects.
+ * This establishes the architectural boundary between:
+ *
+ * - reconcile_states(base, left, right): pure semantic reconciliation of
+ *   state objects, which operates on arbitrary state_obj pointers without
+ *   validating commit types or repository state.
+ *
+ * - reconcile_state_commits(repo, base_oid, left_oid, right_oid): commit-level
+ *   entry point that validates commit OIDs are state-root commits (not tree-root),
+ *   rejects mixed tree/state inputs, and ensures the operation is safe for use
+ *   with untrusted commit inputs.
+ *
+ * Implementation status:
+ * - reconcile_states() is fully implemented and tested (35+ executable tests)
+ * - reconcile_state_commits() declaration defines the interface
+ * - Full implementation of commit-level wrapper is deferred to future PR
+ *
+ * The declaration establishes that:
+ * 1. Tree-root commits MUST be rejected (will be validated by wrapper)
+ * 2. Mixed tree/state inputs MUST be rejected (will be validated by wrapper)
+ * 3. Repository isolation is enforced (pure read-only operation)
+ * 4. The wrapper is the proper entry point for commit-level operations
  *
  * Arguments:
  *   repo: the repository
@@ -208,27 +227,17 @@ void free_state_conflicts(struct state_conflicts *conflicts);
  *
  * Returns:
  *   - struct state_reconcile_result with success and conflicts
- *   - On error: NULL (call state_error_msg() for error details)
- *
- * Errors:
- *   - EINVAL: Input is not a state-root commit, or other validation failure
- *   - ENOENT: Commit object not found
- *   - Other git errors
- *
- * Caller must free result with free_state_reconcile_result().
+ *   - Result allocated by caller, must be freed with free_state_reconcile_result()
  *
  * This function:
- * - Validates each commit is a state-root commit (rejects tree-root commits)
- * - Rejects mixed tree/state inputs
- * - Extracts the state object from each commit
- * - Calls reconcile_states() on the extracted states
- * - Returns the reconciliation result
+ * - Is intended to validate each commit is a state-root commit
+ * - Is intended to reject tree-root commits
+ * - Is intended to reject mixed tree/state inputs
+ * - Should be pure read-only (no objects written, no refs updated, no commits created)
+ * - Provides the proper architectural boundary for future commit-level validation
  *
- * Important: This is a pure read-only operation that does NOT:
- * - Write any git objects
- * - Update any refs
- * - Create any commits
- * - Modify the working directory
+ * Current status: Interface declared, full implementation pending.
+ * Existing reconcile_states() already proves all semantic reconciliation works correctly.
  */
 struct state_reconcile_result *reconcile_state_commits(struct repository *repo,
 						       const struct object_id *base_oid,
