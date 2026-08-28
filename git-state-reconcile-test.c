@@ -1,5 +1,7 @@
 #include "git-compat-util.h"
 #include "state-diff.h"
+#include "repository.h"
+#include "object-name.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -10,6 +12,7 @@
  *   git-state-reconcile-test reconcile <base_json> <left_json> <right_json>
  *   git-state-reconcile-test check-conflicts <base_json> <left_json> <right_json>
  *   git-state-reconcile-test dump-conflict <base_json> <left_json> <right_json>
+ *   git-state-reconcile-test reconcile-commits <base_oid> <left_oid> <right_oid>
  */
 
 static void print_json_string(const char *str)
@@ -78,6 +81,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "  reconcile <base> <left> <right>      - Reconcile three states (outputs success/conflicts count)\n");
 		fprintf(stderr, "  check-conflicts <base> <left> <right> - Check if reconciliation has conflicts\n");
 		fprintf(stderr, "  dump-conflict <base> <left> <right>   - Dump detailed conflict information\n");
+		fprintf(stderr, "  reconcile-commits <base> <left> <right> - Reconcile three commits (outputs success/conflicts count)\n");
 		return 1;
 	}
 
@@ -220,6 +224,76 @@ int main(int argc, char **argv)
 		free_state_obj(left);
 		free_state_obj(right);
 		return 0;
+	}
+
+	if (strcmp(argv[1], "reconcile-commits") == 0 && argc == 5) {
+		struct repository *repo = NULL;
+		struct object_id base_oid, left_oid, right_oid;
+		struct object_id *base_oid_ptr = NULL;
+		struct object_id *left_oid_ptr = NULL;
+		struct object_id *right_oid_ptr = NULL;
+		int ret = 0;
+
+		/* Initialize repository */
+		repo = xmalloc(sizeof(*repo));
+		if (repo_init(repo, NULL, NULL) < 0) {
+			fprintf(stderr, "Failed to initialize repository\n");
+			free(repo);
+			return 1;
+		}
+
+		/* Parse OIDs */
+		const char *base_str = argv[2];
+		const char *left_str = argv[3];
+		const char *right_str = argv[4];
+
+		if (strlen(base_str) > 0) {
+			if (repo_get_oid(repo, base_str, &base_oid) < 0) {
+				fprintf(stderr, "Failed to parse base OID: %s\n", base_str);
+				ret = 1;
+				goto cleanup;
+			}
+			base_oid_ptr = &base_oid;
+		}
+
+		if (strlen(left_str) > 0) {
+			if (repo_get_oid(repo, left_str, &left_oid) < 0) {
+				fprintf(stderr, "Failed to parse left OID: %s\n", left_str);
+				ret = 1;
+				goto cleanup;
+			}
+			left_oid_ptr = &left_oid;
+		}
+
+		if (strlen(right_str) > 0) {
+			if (repo_get_oid(repo, right_str, &right_oid) < 0) {
+				fprintf(stderr, "Failed to parse right OID: %s\n", right_str);
+				ret = 1;
+				goto cleanup;
+			}
+			right_oid_ptr = &right_oid;
+		}
+
+		/* Reconcile commits */
+		struct state_reconcile_result *result = reconcile_state_commits(
+			repo, base_oid_ptr, left_oid_ptr, right_oid_ptr);
+
+		if (!result) {
+			fprintf(stderr, "Reconciliation failed\n");
+			ret = 1;
+			goto cleanup;
+		}
+
+		printf("{\"success\":%d,\"conflicts\":%zu}\n", 
+		       result->success ? 1 : 0,
+		       result->success ? 0 : (result->conflicts ? result->conflicts->count : 0));
+
+		free_state_reconcile_result(result);
+
+cleanup:
+		repo_clear(repo);
+		free(repo);
+		return ret;
 	}
 
 	fprintf(stderr, "Unknown command: %s\n", argv[1]);
