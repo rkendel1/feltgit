@@ -1267,15 +1267,17 @@ static int log_tree_diff(struct rev_info *opt, struct commit *commit, struct log
 		}
 		
 		if (is_state && parent_is_state) {
+			/* Both state commits - diff state blobs */
 			diff_state_oid(parent_oid, oid, "", &opt->diffopt);
 		} else if (!is_state && !parent_is_state) {
+			/* Both tree commits - use normal tree diff */
 			diff_tree_oid(parent_oid, oid, "", &opt->diffopt);
 		} else if (is_state && !parent_is_state) {
-			/* State commit with tree parent - show state blob as modified */
+			/* State commit with tree parent - show state blob as new file */
 			diff_state_oid(NULL, oid, "", &opt->diffopt);
 		} else {
-			/* Tree commit with state parent - show tree as modified from state */
-			diff_tree_oid(parent_oid, oid, "", &opt->diffopt);
+			/* Tree commit with state parent - show tree as new, ignoring state parent */
+			diff_root_tree_oid(oid, "", &opt->diffopt);
 		}
 		
 		log_tree_diff_flush(opt);
