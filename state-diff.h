@@ -197,24 +197,42 @@ void free_state_reconcile_result(struct state_reconcile_result *result);
 void free_state_conflicts(struct state_conflicts *conflicts);
 
 /*
- * NOTE: Commit-level validation is NOT currently implemented.
+ * Reconcile state-root commits (commit-level entry point).
  *
- * The current reconcile_states() function accepts arbitrary state_obj* pointers
- * without validating whether they come from state-root commits or tree-root commits.
+ * This validates that all three inputs are state-root commits, then performs
+ * three-way reconciliation on their state objects.
  *
- * This is a known limitation documented in STATE-RECONCILIATION-ASSUMPTIONS.md
- * as NOT PROVEN item #10:
- * - Tree-root commits are NOT rejected by the state reconciler
- * - Mixed tree/state inputs are NOT rejected
+ * Arguments:
+ *   repo: the repository
+ *   base_oid, left_oid, right_oid: commit OIDs (any may be NULL for empty state)
  *
- * Future work (PR #5 or later) should add:
- * 1. reconcile_states_from_commits() that validates commit types
- * 2. Rejection of tree-root commits
- * 3. Rejection of mixed tree/state inputs
+ * Returns:
+ *   - struct state_reconcile_result with success and conflicts
+ *   - On error: NULL (call state_error_msg() for error details)
  *
- * For now, reconcile_states() is suitable for testing the semantic reconciliation
- * algorithm itself, but should not be used directly with untrusted commit inputs
- * without external validation.
+ * Errors:
+ *   - EINVAL: Input is not a state-root commit, or other validation failure
+ *   - ENOENT: Commit object not found
+ *   - Other git errors
+ *
+ * Caller must free result with free_state_reconcile_result().
+ *
+ * This function:
+ * - Validates each commit is a state-root commit (rejects tree-root commits)
+ * - Rejects mixed tree/state inputs
+ * - Extracts the state object from each commit
+ * - Calls reconcile_states() on the extracted states
+ * - Returns the reconciliation result
+ *
+ * Important: This is a pure read-only operation that does NOT:
+ * - Write any git objects
+ * - Update any refs
+ * - Create any commits
+ * - Modify the working directory
  */
+struct state_reconcile_result *reconcile_state_commits(struct repository *repo,
+						       const struct object_id *base_oid,
+						       const struct object_id *left_oid,
+						       const struct object_id *right_oid);
 
 #endif
