@@ -283,11 +283,23 @@ int commit_tree(const char *msg, size_t msg_len,
 		const struct commit_list *parents, struct object_id *ret,
 		const char *author, const char *sign_commit);
 
+int commit_state(const char *msg, size_t msg_len,
+		 const struct object_id *state,
+		 const struct commit_list *parents, struct object_id *ret,
+		 const char *author, const char *sign_commit);
+
 int commit_tree_extended(const char *msg, size_t msg_len,
 			 const struct object_id *tree,
 			 const struct commit_list *parents, struct object_id *ret,
 			 const char *author, const char *committer,
 			 const char *sign_commit, const struct commit_extra_header *);
+
+int commit_state_extended(const char *msg, size_t msg_len,
+			  const struct object_id *state,
+			  const struct commit_list *parents, struct object_id *ret,
+			  const char *author, const char *committer,
+			  const char *sign_commit,
+			  const struct commit_extra_header *);
 
 struct commit_extra_header *read_commit_extra_headers(struct commit *, const char **);
 

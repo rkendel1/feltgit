@@ -19,6 +19,8 @@ static const char * const commit_tree_usage[] = {
 	N_("git commit-tree <tree> [(-p <parent>)...]"),
 	N_("git commit-tree [(-p <parent>)...] [-S[<keyid>]] [(-m <message>)...]\n"
 	   "                [(-F <file>)...] <tree>"),
+	N_("git commit-tree --experimental-state [(-p <parent>)...]\n"
+	   "                [-S[<keyid>]] [(-m <message>)...] [(-F <file>)...] <blob>"),
 	NULL
 };
 
@@ -99,8 +101,9 @@ int cmd_commit_tree(int argc,
 {
 	static struct strbuf buffer = STRBUF_INIT;
 	struct commit_list *parents = NULL;
-	struct object_id tree_oid;
+	struct object_id root_oid;
 	struct object_id commit_oid;
+	int experimental_state = 0;
 
 	struct option options[] = {
 		OPT_CALLBACK_F('p', NULL, &parents, N_("parent"),
@@ -122,6 +125,8 @@ int cmd_commit_tree(int argc,
 			.flags = PARSE_OPT_OPTARG,
 			.defval = (intptr_t) "",
 		},
+		OPT_BOOL(0, "experimental-state", &experimental_state,
+			 N_("create a commit rooted at a state blob (EXPERIMENTAL)")),
 		OPT_END()
 	};
 	int ret;
@@ -136,16 +141,24 @@ int cmd_commit_tree(int argc,
 	if (argc != 1)
 		die(_("must give exactly one tree"));
 
-	if (repo_get_oid_tree(the_repository, argv[0], &tree_oid))
-		die(_("not a valid object name %s"), argv[0]);
+	if (experimental_state) {
+		if (repo_get_oid_blob(the_repository, argv[0], &root_oid))
+			die(_("not a valid blob object name %s"), argv[0]);
+	} else {
+		if (repo_get_oid_tree(the_repository, argv[0], &root_oid))
+			die(_("not a valid object name %s"), argv[0]);
+	}
 
 	if (!buffer.len) {
 		if (strbuf_read(&buffer, 0, 0) < 0)
 			die_errno(_("git commit-tree: failed to read"));
 	}
 
-	if (commit_tree(buffer.buf, buffer.len, &tree_oid, parents, &commit_oid,
-			NULL, sign_commit)) {
+	if ((experimental_state
+	     ? commit_state(buffer.buf, buffer.len, &root_oid, parents,
+			    &commit_oid, NULL, sign_commit)
+	     : commit_tree(buffer.buf, buffer.len, &root_oid, parents,
+			   &commit_oid, NULL, sign_commit))) {
 		ret = 1;
 		goto out;
 	}

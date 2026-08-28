@@ -517,10 +517,11 @@ int parse_commit_buffer(struct repository *r, struct commit *item, const void *b
 {
 	const char *tail = buffer;
 	const char *bufptr = buffer;
+	const char *eol;
+	bool is_state = false;
 	struct object_id parent;
 	struct commit_list **pptr;
 	struct commit_graft *graft;
-	const int tree_entry_len = the_hash_algo->hexsz + 5;
 	const int parent_entry_len = the_hash_algo->hexsz + 7;
 	struct tree *tree;
 
@@ -536,19 +537,29 @@ int parse_commit_buffer(struct repository *r, struct commit *item, const void *b
 	item->parents = NULL;
 
 	tail += size;
-	if (tail <= bufptr + tree_entry_len + 1 || memcmp(bufptr, "tree ", 5) ||
-			bufptr[tree_entry_len] != '\n')
+	if (skip_prefix(bufptr, "tree ", &bufptr)) {
+		is_state = false;
+	} else if (skip_prefix(bufptr, "state ", &bufptr)) {
+		is_state = true;
+	} else {
 		return error("bogus commit object %s", oid_to_hex(&item->object.oid));
-	if (get_oid_hex(bufptr + 5, &parent) < 0)
-		return error("bad tree pointer in commit %s",
+	}
+
+	if (parse_oid_hex_algop(bufptr, &parent, &eol, r->hash_algo) || *eol != '\n')
+		return error(is_state ? "bad state pointer in commit %s" :
+			     "bad tree pointer in commit %s",
 			     oid_to_hex(&item->object.oid));
-	tree = lookup_tree(r, &parent);
-	if (!tree)
-		return error("bad tree pointer %s in commit %s",
-			     oid_to_hex(&parent),
-			     oid_to_hex(&item->object.oid));
-	set_commit_tree(item, tree);
-	bufptr += tree_entry_len + 1; /* "tree " + "hex sha1" + "\n" */
+
+	if (!is_state) {
+		tree = lookup_tree(r, &parent);
+		if (!tree)
+			return error("bad tree pointer %s in commit %s",
+				     oid_to_hex(&parent),
+				     oid_to_hex(&item->object.oid));
+		set_commit_tree(item, tree);
+	}
+
+	bufptr = eol + 1;
 	pptr = &item->parents;
 
 	graft = lookup_commit_graft(r, &item->object.oid);
@@ -1569,6 +1580,20 @@ int commit_tree(const char *msg, size_t msg_len, const struct object_id *tree,
 	return result;
 }
 
+int commit_state(const char *msg, size_t msg_len, const struct object_id *state,
+		 const struct commit_list *parents, struct object_id *ret,
+		 const char *author, const char *sign_commit)
+{
+	struct commit_extra_header *extra = NULL, **tail = &extra;
+	int result;
+
+	append_merge_tag_headers(parents, &tail);
+	result = commit_state_extended(msg, msg_len, state, parents, ret, author,
+				      NULL, sign_commit, extra);
+	free_commit_extra_headers(extra);
+	return result;
+}
+
 static bool has_invalid_utf8(const char *buf, size_t len, size_t *bad_offset)
 {
 	size_t offset = 0;
@@ -1683,8 +1708,9 @@ N_("Warning: commit message did not conform to UTF-8.\n"
    "You may want to amend it after fixing the message, or set the config\n"
    "variable i18n.commitEncoding to the encoding your project uses.\n");
 
-static void write_commit_tree(struct strbuf *buffer, const char *msg, size_t msg_len,
-			      const struct object_id *tree,
+static void write_commit_root(struct strbuf *buffer, const char *msg, size_t msg_len,
+			      const char *root_header,
+			      const struct object_id *root,
 			      const struct object_id *parents, size_t parents_len,
 			      const char *author, const char *committer,
 			      const struct commit_extra_header *extra)
@@ -1696,7 +1722,7 @@ static void write_commit_tree(struct strbuf *buffer, const char *msg, size_t msg
 	encoding_is_utf8 = is_encoding_utf8(git_commit_encoding);
 
 	strbuf_grow(buffer, 8192); /* should avoid reallocs for the headers */
-	strbuf_addf(buffer, "tree %s\n", oid_to_hex(tree));
+	strbuf_addf(buffer, "%s %s\n", root_header, oid_to_hex(root));
 
 	/*
 	 * NOTE! This ordering means that the same exact tree merged with a
@@ -1726,12 +1752,16 @@ static void write_commit_tree(struct strbuf *buffer, const char *msg, size_t msg
 	strbuf_add(buffer, msg, msg_len);
 }
 
-int commit_tree_extended(const char *msg, size_t msg_len,
-			 const struct object_id *tree,
-			 const struct commit_list *parents, struct object_id *ret,
-			 const char *author, const char *committer,
-			 const char *sign_commit,
-			 const struct commit_extra_header *extra)
+static int commit_root_extended(const char *msg, size_t msg_len,
+				const char *root_header,
+				const struct object_id *root,
+				enum object_type root_type,
+				const struct commit_list *parents,
+				struct object_id *ret,
+				const char *author,
+				const char *committer,
+				const char *sign_commit,
+				const struct commit_extra_header *extra)
 {
 	struct repository *r = the_repository;
 	int result = 0;
@@ -1741,12 +1771,13 @@ int commit_tree_extended(const char *msg, size_t msg_len,
 	struct strbuf sig = STRBUF_INIT, compat_sig = STRBUF_INIT;
 	struct object_id *parent_buf = NULL, *compat_oid = NULL;
 	struct object_id compat_oid_buf;
+	struct object_id mapped_root;
 	size_t i, nparents;
 
 	/* Not having i18n.commitencoding is the same as having utf-8 */
 	encoding_is_utf8 = is_encoding_utf8(git_commit_encoding);
 
-	odb_assert_oid_type(the_repository->objects, tree, OBJ_TREE);
+	odb_assert_oid_type(the_repository->objects, root, root_type);
 
 	if (memchr(msg, '\0', msg_len))
 		return error("a NUL byte in commit log message not allowed.");
@@ -1757,7 +1788,8 @@ int commit_tree_extended(const char *msg, size_t msg_len,
 	for (const struct commit_list *p = parents; p; p = p->next)
 		oidcpy(&parent_buf[i++], &p->item->object.oid);
 
-	write_commit_tree(&buffer, msg, msg_len, tree, parent_buf, nparents, author, committer, extra);
+	write_commit_root(&buffer, msg, msg_len, root_header, root,
+			 parent_buf, nparents, author, committer, extra);
 
 	/* And check the encoding. */
 	if (encoding_is_utf8 && !ensure_utf8(&buffer)) {
@@ -1772,12 +1804,11 @@ int commit_tree_extended(const char *msg, size_t msg_len,
 	}
 	if (r->compat_hash_algo) {
 		struct commit_extra_header *compat_extra = NULL;
-		struct object_id mapped_tree;
 		struct object_id *mapped_parents;
 
 		CALLOC_ARRAY(mapped_parents, nparents);
 
-		if (repo_oid_to_algop(r, tree, r->compat_hash_algo, &mapped_tree)) {
+		if (repo_oid_to_algop(r, root, r->compat_hash_algo, &mapped_root)) {
 			result = -1;
 			free(mapped_parents);
 			goto out;
@@ -1793,8 +1824,9 @@ int commit_tree_extended(const char *msg, size_t msg_len,
 			free(mapped_parents);
 			goto out;
 		}
-		write_commit_tree(&compat_buffer, msg, msg_len, &mapped_tree,
-				  mapped_parents, nparents, author, committer, compat_extra);
+		write_commit_root(&compat_buffer, msg, msg_len, root_header,
+				  &mapped_root, mapped_parents, nparents,
+				  author, committer, compat_extra);
 		free_commit_extra_headers(compat_extra);
 		free(mapped_parents);
 
@@ -1854,6 +1886,30 @@ out:
 	strbuf_release(&sig);
 	strbuf_release(&compat_sig);
 	return result;
+}
+
+int commit_tree_extended(const char *msg, size_t msg_len,
+			 const struct object_id *tree,
+			 const struct commit_list *parents, struct object_id *ret,
+			 const char *author, const char *committer,
+			 const char *sign_commit,
+			 const struct commit_extra_header *extra)
+{
+	return commit_root_extended(msg, msg_len, "tree", tree, OBJ_TREE,
+				    parents, ret, author, committer,
+				    sign_commit, extra);
+}
+
+int commit_state_extended(const char *msg, size_t msg_len,
+			  const struct object_id *state,
+			  const struct commit_list *parents, struct object_id *ret,
+			  const char *author, const char *committer,
+			  const char *sign_commit,
+			  const struct commit_extra_header *extra)
+{
+	return commit_root_extended(msg, msg_len, "state", state, OBJ_BLOB,
+				    parents, ret, author, committer,
+				    sign_commit, extra);
 }
 
 define_commit_slab(merge_desc_slab, struct merge_remote_desc *);

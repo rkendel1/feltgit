@@ -1,0 +1,53 @@
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /private/tmp/feltgit-state-probe-repo/.git/
+[master (root-commit) aefde55] base
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+PARENT=aefde55218391179303e7e1d9f4245feaec16372
+STATE=cb86aabfc2acc6c86551938619487805a02dbaea
+STATE_COMMIT=0dc10ae25c1a5bcb396a12a72f7de8dd52990d39
+--- CAT-FILE ---
+state cb86aabfc2acc6c86551938619487805a02dbaea
+parent aefde55218391179303e7e1d9f4245feaec16372
+author Probe <probe@example.com> 1787951597 -0400
+committer Probe <probe@example.com> 1787951597 -0400
+
+probe
+--- REV-LIST ---
+0dc10ae25c1a5bcb396a12a72f7de8dd52990d39
+aefde55218391179303e7e1d9f4245feaec16372
+--- LOG --ONELINE ---
+0dc10ae probe
+aefde55 base
+--- LOG -P ---
+commit 0dc10ae25c1a5bcb396a12a72f7de8dd52990d39
+Author: Probe <probe@example.com>
+Date:   Fri Aug 28 17:13:17 2026 -0400
+
+    probe
+
+diff --git a/f.txt b/f.txt
+deleted file mode 100644
+index df967b9..0000000
+--- a/f.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-base
+--- FSCK ---
+error in commit 0dc10ae25c1a5bcb396a12a72f7de8dd52990d39: broken links
+error in commit 0dc10ae25c1a5bcb396a12a72f7de8dd52990d39: missingTree: invalid format - expected 'tree' line
+broken link from  commit 0dc10ae25c1a5bcb396a12a72f7de8dd52990d39
+broken link from    tree unknown
+dangling blob cb86aabfc2acc6c86551938619487805a02dbaea

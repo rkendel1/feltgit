@@ -1,0 +1,51 @@
+Captured from terminal 7f93151a-e2e6-4e6d-a485-e3e9d554710a at safe termination time:
+
+# passed all 232 test(s)
+1..232
+*** t7005-editor.sh ***
+ok 1 - determine default editor
+ok 2 - setup
+ok 3 - dumb should error out when falling back on vi
+ok 4 - dumb should prefer EDITOR to VISUAL
+ok 5 - Using vi
+ok 6 - Using EDITOR
+ok 7 - Using VISUAL
+ok 8 - Using core_editor
+ok 9 - Using GIT_EDITOR
+ok 10 - Using editors with overrides
+ok 11 - editor with a space
+ok 12 - core.editor with a space
+# passed all 12 test(s)
+1..12
+*** t7006-pager.sh ***
+ok 1 - determine default pager
+ok 2 - setup
+...
+ok 109 # skip non-existent pager doesnt cause crash (missing TTY)
+# passed all 109 test(s)
+1..109
+*** t7007-show.sh ***
+...
+# passed all 18 test(s)
+1..18
+*** t7008-filter-branch-null-sha1.sh ***
+...
+# passed all 6 test(s)
+1..6
+*** t7010-setup.sh ***
+ok 1 - setup
+ok 2 - git add (absolute)
+ok 3 - git add (funny relative)
+ok 4 - git rm (absolute)
+ok 5 - git rm (funny relative)
+ok 6 - git ls-files (absolute)
+ok 7 - git ls-files (relative #1)
+ok 8 - git ls-files (relative #2)
+ok 9 - git ls-files (relative #3)
+ok 10 - commit using absolute path names
+ok 11 - log using absolute path names
+ok 12 - blame using absolute path names
+ok 13 - setup deeper work tree
+ok 14 - add a directory outside the work tree
+ok 15 - add a file outside the work tree, nasty case 1
+ok 16 - add a file outside the work tree, nasty case 2
