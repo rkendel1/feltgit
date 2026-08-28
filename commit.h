@@ -171,6 +171,7 @@ void free_commit_buffer(struct parsed_object_pool *pool, struct commit *);
 
 struct tree *repo_get_commit_tree(struct repository *, const struct commit *);
 struct object_id *get_commit_tree_oid(const struct commit *);
+struct object_id *get_commit_state_oid(const struct commit *);
 
 /*
  * Release memory related to a commit, including the parent list and

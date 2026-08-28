@@ -1203,6 +1203,15 @@ static int log_tree_diff(struct rev_info *opt, struct commit *commit, struct log
 	}
 
 	parse_commit_or_die(commit);
+	
+	/* Reject state commits in diff output for now */
+	if (commit->is_state_commit) {
+		fprintf(opt->diffopt.file,
+			"diff: state-commit diff not yet supported; "
+			"use experimental state-diff tool\n");
+		return 0;
+	}
+	
 	oid = get_commit_tree_oid(commit);
 
 	parents = get_saved_parents(opt, commit);
@@ -1248,6 +1257,15 @@ static int log_tree_diff(struct rev_info *opt, struct commit *commit, struct log
 		struct commit *parent = parents->item;
 
 		parse_commit_or_die(parent);
+		
+		/* Reject state commits in diff output */
+		if (parent->is_state_commit || commit->is_state_commit) {
+			fprintf(opt->diffopt.file,
+				"diff: mixed-root (state/tree) or state-to-state diff "
+				"not yet supported\n");
+			return 0;
+		}
+		
 		diff_tree_oid(get_commit_tree_oid(parent),
 			      oid, "", &opt->diffopt);
 		log_tree_diff_flush(opt);
