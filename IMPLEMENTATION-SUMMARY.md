@@ -4,7 +4,7 @@ This document summarizes the implementation of the state-root integrity experime
 
 ## Overview
 
-The experiment generalizes Git's commit integrity model from:
+The experiment generalizes Git's fsck commit integrity validation from:
 ```
 commit → tree
 ```
@@ -17,7 +17,7 @@ commit → root
          └── state
 ```
 
-This allows commits to reference either a tree object (as in normal Git) or a state blob (for application-state versioning).
+This allows commits to reference either a tree object (as in normal Git) or a state blob (for application-state versioning), with fsck correctly validating both root types.
 
 ## Implementation Details
 
