@@ -469,6 +469,12 @@ static int objects_equal(const struct state_object *a, const struct state_object
 
 static int values_equal(const struct state_value *a, const struct state_value *b)
 {
+	/* Handle NULL pointers */
+	if (a == NULL && b == NULL)
+		return 1;
+	if (a == NULL || b == NULL)
+		return 0;
+
 	if (a->type != b->type)
 		return 0;
 
