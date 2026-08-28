@@ -894,9 +894,12 @@ static int set_value_at_path(struct state_object *root, const char *path,
 			if (!found) {
 				/* Add new key */
 				if (current->count >= current->capacity) {
+					size_t old_capacity = current->capacity;
 					current->capacity = current->capacity > 0 ? current->capacity * 2 : 10;
 					current->keys = xrealloc(current->keys, sizeof(char *) * current->capacity);
 					current->values = xrealloc(current->values, sizeof(struct state_value) * current->capacity);
+					/* Zero-initialize newly allocated values */
+					memset(&current->values[old_capacity], 0, sizeof(struct state_value) * (current->capacity - old_capacity));
 				}
 				current->keys[current->count] = xstrdup(component);
 				current->values[current->count] = *copy_state_value(value);
@@ -918,9 +921,12 @@ static int set_value_at_path(struct state_object *root, const char *path,
 			if (!found) {
 				/* Create new object */
 				if (current->count >= current->capacity) {
+					size_t old_capacity = current->capacity;
 					current->capacity = current->capacity > 0 ? current->capacity * 2 : 10;
 					current->keys = xrealloc(current->keys, sizeof(char *) * current->capacity);
 					current->values = xrealloc(current->values, sizeof(struct state_value) * current->capacity);
+					/* Zero-initialize newly allocated values */
+					memset(&current->values[old_capacity], 0, sizeof(struct state_value) * (current->capacity - old_capacity));
 				}
 
 				struct state_object *new_obj = xmalloc(sizeof(*new_obj));
