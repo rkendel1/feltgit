@@ -434,34 +434,9 @@ All tests call `git-state-reconcile-test` which:
 
 ## Evidence Summary
 
-All 18 contracted invariants now have executable evidence:
-
-### Reconciliation Algorithm (5 rules) ✅
-1. **Unchanged**: Tests prove no modification passes through
-2. **Left-only**: Tests prove left modifications applied when right unchanged
-3. **Right-only**: Tests prove right modifications applied when left unchanged
-4. **Both identical**: Tests prove concurrent identical modifications merge
-5. **Conflicting**: Tests prove conflicting modifications detected and reported
-
-### Add/Remove Semantics ✅
-- Add/add same: handled by merge rules
-- Add/add different: conflicts correctly
-- Left-only add: applied
-- Right-only add: applied
-- Left-only removal: applied
-- Right-only removal: applied
-- Remove vs modify: explicit conflict with base/left/right values
-
-### Merge Semantics ✅
-- Independent nested modifications: merge correctly
-- Identical concurrent modifications: no conflict
-- Nested object structure: preserved
-- Canonical key ordering: invariant (byte-for-byte identical output)
-- Deterministic output: repeatable
-
-### Existing Behavior ✅
-- No unauthorized authority: pure function (no policy baked in)
-- Arrays explicitly rejected: parse errors on array input
+The semantic reconciliation invariants are proven by executable tests.
+Commit-level validation of tree-root, state-root, and mixed-root commits 
+is explicitly outside the scope of this PR and remains future work.
 
 ## PROVEN IN THIS PR
 
