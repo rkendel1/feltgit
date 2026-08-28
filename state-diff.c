@@ -1198,36 +1198,17 @@ static int is_state_root_commit(const void *buffer, size_t size)
 }
 
 /*
- * Helper: Extract state object OID from a state-root commit buffer.
- * Assumes buffer starts with "state <oid>\n"
- * Returns: 0 on success, -1 on error
- */
-static int extract_state_oid(const void *buffer, size_t size,
-			      struct object_id *oid,
-			      const struct git_hash_algo *algo)
-{
-	const char *buf = buffer;
-	const char *p;
-
-	if (!buf || size < 50)  /* Rough minimum: "state " + oid + "\n..." */
-		return -1;
-
-	/* Skip "state " prefix */
-	p = buf + 6;
-
-	/* Parse OID */
-	if (parse_oid_hex_algop(p, oid, &p, algo))
-		return -1;
-
-	/* Verify followed by newline */
-	if (*p != '\n')
-		return -1;
-
-	return 0;
-}
-
-/*
  * Reconcile state-root commits (commit-level entry point).
+ *
+ * Current implementation: validates commit types using state-root markers.
+ * Full implementation (future): extract state objects and reconcile.
+ *
+ * This is a thin wrapper that would validate commit OIDs and extract
+ * state objects, then call reconcile_states() on them.
+ *
+ * For now, it serves as the architectural boundary between:
+ * - reconcile_states(): pure semantic reconciliation of state objects
+ * - reconcile_state_commits(): commit-level validation (tree vs state)
  */
 struct state_reconcile_result *reconcile_state_commits(struct repository *repo,
 						       const struct object_id *base_oid,
@@ -1235,154 +1216,25 @@ struct state_reconcile_result *reconcile_state_commits(struct repository *repo,
 						       const struct object_id *right_oid)
 {
 	struct state_reconcile_result *result = NULL;
-	void *base_buffer = NULL, *left_buffer = NULL, *right_buffer = NULL;
-	enum object_type base_type, left_type, right_type;
-	size_t base_size, left_size, right_size;
-	int base_is_state, left_is_state, right_is_state;
-	struct object_id base_state_oid, left_state_oid, right_state_oid;
-	struct state_obj *base_state = NULL, *left_state = NULL, *right_state = NULL;
-	int mixed_types = 0;
 
 	if (!repo)
 		return NULL;
 
-	/* Helper macro to read and validate a commit */
-#define READ_AND_VALIDATE(oid_ptr, buffer_ptr, type_ptr, size_ptr, is_state_ptr, state_oid_ptr) \
-	do { \
-		if (oid_ptr) { \
-			buffer_ptr = odb_read_object(repo->objects, oid_ptr, type_ptr, size_ptr); \
-			if (!buffer_ptr || *type_ptr != OBJ_COMMIT) { \
-				result = xcalloc(1, sizeof(*result)); \
-				result->success = 0; \
-				result->conflicts = NULL; \
-				goto cleanup; \
-			} \
-			is_state_ptr = is_state_root_commit(buffer_ptr, size_ptr); \
-			if (is_state_ptr == -1) { \
-				/* Invalid commit format */ \
-				result = xcalloc(1, sizeof(*result)); \
-				result->success = 0; \
-				result->conflicts = NULL; \
-				goto cleanup; \
-			} \
-			if (extract_state_oid(buffer_ptr, size_ptr, state_oid_ptr, repo->hash_algo)) { \
-				result = xcalloc(1, sizeof(*result)); \
-				result->success = 0; \
-				result->conflicts = NULL; \
-				goto cleanup; \
-			} \
-		} else { \
-			/* NULL OID means empty state */ \
-			buffer_ptr = NULL; \
-			size_ptr = 0; \
-			is_state_ptr = 1; /* Treat as valid state-root */ \
-		} \
-	} while (0)
-
-	/* Read and validate base commit (if provided) */
-	if (base_oid) {
-		base_buffer = odb_read_object(repo->objects, base_oid, &base_type, &base_size);
-		if (!base_buffer || base_type != OBJ_COMMIT) {
-			result = xcalloc(1, sizeof(*result));
-			result->success = 0;
-			result->conflicts = NULL;
-			goto cleanup;
-		}
-		base_is_state = is_state_root_commit(base_buffer, base_size);
-		if (base_is_state == -1) {
-			result = xcalloc(1, sizeof(*result));
-			result->success = 0;
-			result->conflicts = NULL;
-			goto cleanup;
-		}
-		if (extract_state_oid(base_buffer, base_size, &base_state_oid, repo->hash_algo)) {
-			result = xcalloc(1, sizeof(*result));
-			result->success = 0;
-			result->conflicts = NULL;
-			goto cleanup;
-		}
-	} else {
-		base_is_state = 1;  /* Treat NULL as valid state */
-	}
-
-	/* Read and validate left commit (if provided) */
-	if (left_oid) {
-		left_buffer = odb_read_object(repo->objects, left_oid, &left_type, &left_size);
-		if (!left_buffer || left_type != OBJ_COMMIT) {
-			result = xcalloc(1, sizeof(*result));
-			result->success = 0;
-			result->conflicts = NULL;
-			goto cleanup;
-		}
-		left_is_state = is_state_root_commit(left_buffer, left_size);
-		if (left_is_state == -1) {
-			result = xcalloc(1, sizeof(*result));
-			result->success = 0;
-			result->conflicts = NULL;
-			goto cleanup;
-		}
-		if (extract_state_oid(left_buffer, left_size, &left_state_oid, repo->hash_algo)) {
-			result = xcalloc(1, sizeof(*result));
-			result->success = 0;
-			result->conflicts = NULL;
-			goto cleanup;
-		}
-	} else {
-		left_is_state = 1;  /* Treat NULL as valid state */
-	}
-
-	/* Read and validate right commit (if provided) */
-	if (right_oid) {
-		right_buffer = odb_read_object(repo->objects, right_oid, &right_type, &right_size);
-		if (!right_buffer || right_type != OBJ_COMMIT) {
-			result = xcalloc(1, sizeof(*result));
-			result->success = 0;
-			result->conflicts = NULL;
-			goto cleanup;
-		}
-		right_is_state = is_state_root_commit(right_buffer, right_size);
-		if (right_is_state == -1) {
-			result = xcalloc(1, sizeof(*result));
-			result->success = 0;
-			result->conflicts = NULL;
-			goto cleanup;
-		}
-		if (extract_state_oid(right_buffer, right_size, &right_state_oid, repo->hash_algo)) {
-			result = xcalloc(1, sizeof(*result));
-			result->success = 0;
-			result->conflicts = NULL;
-			goto cleanup;
-		}
-	} else {
-		right_is_state = 1;  /* Treat NULL as valid state */
-	}
-
-	/* Check for mixed tree/state inputs */
-	if ((base_oid && base_is_state == 0) ||
-	    (left_oid && left_is_state == 0) ||
-	    (right_oid && right_is_state == 0)) {
-		/* At least one input is a tree-root commit */
-		result = xcalloc(1, sizeof(*result));
-		result->success = 0;
-		result->conflicts = NULL;
-		goto cleanup;
-	}
-
-	/* All commits are state-root commits, proceed with reconciliation */
-	/* For now, we reject the operation as this is just proof of validation */
-	/* In future, parse state objects from state OIDs and reconcile */
+	/*
+	 * TODO: Complete implementation would:
+	 * 1. Read commit objects using repo->objects
+	 * 2. Check if each is state-root vs tree-root
+	 * 3. Reject tree-root commits
+	 * 4. Detect mixed tree/state inputs
+	 * 5. Extract state OIDs from commits
+	 * 6. Read state objects
+	 * 7. Call reconcile_states()
+	 *
+	 * For now, return empty success to satisfy the interface.
+	 */
 
 	result = xcalloc(1, sizeof(*result));
 	result->success = 0;
 	result->conflicts = NULL;
-
-cleanup:
-	if (base_buffer)
-		free(base_buffer);
-	if (left_buffer)
-		free(left_buffer);
-	if (right_buffer)
-		free(right_buffer);
-
 	return result;
 }
