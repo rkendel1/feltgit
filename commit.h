@@ -36,6 +36,12 @@ struct commit {
 	 */
 	struct tree *maybe_tree;
 	unsigned int index;
+	unsigned int is_state_commit : 1;
+	/*
+	 * For experimental state commits, this stores the OID of the state object.
+	 * NULL for tree commits.
+	 */
+	struct object_id *maybe_state_oid;
 };
 
 extern int save_commit_buffer;

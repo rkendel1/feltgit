@@ -1152,4 +1152,161 @@ test_expect_success 'fsck reports problems in current worktree index without fil
 	test_cmp expect actual
 '
 
+# State-root integrity tests
+# These tests verify that commits can have either a tree or a state as their root.
+
+test_expect_success 'state commit with valid state blob passes fsck' '
+	git init --bare state-repo &&
+	(
+		cd state-repo &&
+		# Create a state blob (just a blob, not a tree)
+		state_blob=$(printf "%s" "{\"key\": \"value\"}" | git hash-object -w --stdin) &&
+		# Create a state commit manually
+		state_commit_text="state $state_blob
+author Test <test@example.com> 1234567890 +0000
+committer Test <test@example.com> 1234567890 +0000
+
+state commit" &&
+		state_commit=$(printf "%s" "$state_commit_text" | git hash-object -w -t commit --stdin) &&
+		git update-ref refs/heads/state $state_commit &&
+		# fsck should pass
+		git fsck
+	)
+'
+
+test_expect_success 'normal tree commit still passes fsck' '
+	git init normal-repo &&
+	(
+		cd normal-repo &&
+		git config user.name "Test" &&
+		git config user.email "test@example.com" &&
+		echo "content" >file &&
+		git add file &&
+		git commit -m "normal commit" &&
+		# fsck should pass
+		git fsck
+	)
+'
+
+test_expect_success 'state commit with missing state object fails fsck' '
+	git init --bare missing-state-repo &&
+	(
+		cd missing-state-repo &&
+		# Create a state blob
+		state_blob=$(printf "%s" "{\"key\": \"value\"}" | git hash-object -w --stdin) &&
+		# Create a state commit
+		state_commit_text="state $state_blob
+author Test <test@example.com> 1234567890 +0000
+committer Test <test@example.com> 1234567890 +0000
+
+state commit" &&
+		state_commit=$(printf "%s" "$state_commit_text" | git hash-object -w -t commit --stdin) &&
+		# Remove the state blob
+		rm .git/objects/$(printf "%s" "$state_blob" | cut -c1-2)* &&
+		# Create a ref to the state commit
+		git update-ref refs/heads/state $state_commit &&
+		# fsck should fail
+		test_must_fail git fsck 2>out &&
+		test_grep "error" out
+	)
+'
+
+test_expect_success 'state commit pointing to tree object fails fsck' '
+	git init --bare wrong-type-repo &&
+	(
+		cd wrong-type-repo &&
+		# Create an empty tree
+		empty_tree=$(git mktree </dev/null) &&
+		# Manually create a state commit that points to a tree
+		state_commit_text="state $empty_tree
+author Test <test@example.com> 1234567890 +0000
+committer Test <test@example.com> 1234567890 +0000
+
+state points to tree" &&
+		state_commit=$(printf "%s" "$state_commit_text" | git hash-object -w -t commit --stdin) &&
+		git update-ref refs/heads/state $state_commit &&
+		# fsck should fail because state root must be a blob
+		test_must_fail git fsck 2>out &&
+		test_grep "error" out
+	)
+'
+
+test_expect_success 'state commit with nonexistent state fails fsck' '
+	git init --bare nonexistent-state-repo &&
+	(
+		cd nonexistent-state-repo &&
+		# Create a commit with a fake state OID
+		fake_oid="0000000000000000000000000000000000000000" &&
+		state_commit_text="state $fake_oid
+author Test <test@example.com> 1234567890 +0000
+committer Test <test@example.com> 1234567890 +0000
+
+state commit with nonexistent state" &&
+		state_commit=$(printf "%s" "$state_commit_text" | git hash-object -w -t commit --stdin) &&
+		git update-ref refs/heads/state $state_commit &&
+		# fsck should fail
+		test_must_fail git fsck 2>out &&
+		test_grep "error" out
+	)
+'
+
+test_expect_success 'state commit can have tree commit as parent' '
+	git init --bare mixed-repo &&
+	(
+		cd mixed-repo &&
+		git config user.name "Test" &&
+		git config user.email "test@example.com" &&
+		# Create a tree commit
+		echo "content" >file &&
+		git add file &&
+		tree_commit=$(git commit-tree -m "tree commit" $(git write-tree)) &&
+		
+		# Create a state commit with tree commit as parent
+		state_blob=$(printf "%s" "{\"key\": \"value\"}" | git hash-object -w --stdin) &&
+		state_commit_text="state $state_blob
+parent $tree_commit
+author Test <test@example.com> 1234567890 +0000
+committer Test <test@example.com> 1234567890 +0000
+
+state commit with tree parent" &&
+		state_commit=$(printf "%s" "$state_commit_text" | git hash-object -w -t commit --stdin) &&
+		
+		git update-ref refs/heads/main $state_commit &&
+		# fsck should pass
+		git fsck
+	)
+'
+
+test_expect_success 'tree commit can have state commit as parent' '
+	git init --bare reverse-mixed-repo &&
+	(
+		cd reverse-mixed-repo &&
+		git config user.name "Test" &&
+		git config user.email "test@example.com" &&
+		# Create a state commit first
+		state_blob=$(printf "%s" "{\"key\": \"value\"}" | git hash-object -w --stdin) &&
+		state_commit_text="state $state_blob
+author Test <test@example.com> 1234567890 +0000
+committer Test <test@example.com> 1234567890 +0000
+
+state commit" &&
+		state_commit=$(printf "%s" "$state_commit_text" | git hash-object -w -t commit --stdin) &&
+		
+		# Create a tree commit with state commit as parent
+		echo "content" >file &&
+		git add file &&
+		tree_commit_text="tree $(git write-tree)
+parent $state_commit
+author Test <test@example.com> 1234567890 +0000
+committer Test <test@example.com> 1234567890 +0000
+
+tree commit with state parent" &&
+		tree_commit=$(printf "%s" "$tree_commit_text" | git hash-object -w -t commit --stdin) &&
+		
+		git update-ref refs/heads/main $tree_commit &&
+		# fsck should pass - commit graph is indifferent to root type
+		git fsck
+	)
+'
+
 test_done
