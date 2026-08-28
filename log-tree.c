@@ -1192,7 +1192,6 @@ static int log_tree_diff(struct rev_info *opt, struct commit *commit, struct log
 	struct object_id *oid;
 	int is_merge;
 	int all_need_diff = opt->diff || opt->diffopt.flags.exit_with_status;
-	int is_state = commit->is_state_commit;
 
 	if (!all_need_diff && !opt->merges_need_diff)
 		return 0;
@@ -1205,11 +1204,15 @@ static int log_tree_diff(struct rev_info *opt, struct commit *commit, struct log
 
 	parse_commit_or_die(commit);
 	
-	if (is_state) {
-		oid = get_commit_state_oid(commit);
-	} else {
-		oid = get_commit_tree_oid(commit);
+	/* Reject state commits in diff output for now */
+	if (commit->is_state_commit) {
+		fprintf(opt->diffopt.file,
+			"diff: state-commit diff not yet supported; "
+			"use experimental state-diff tool\n");
+		return 0;
 	}
+	
+	oid = get_commit_tree_oid(commit);
 
 	parents = get_saved_parents(opt, commit);
 	is_merge = parents && parents->next;
@@ -1219,10 +1222,7 @@ static int log_tree_diff(struct rev_info *opt, struct commit *commit, struct log
 	/* Root commit? */
 	if (!parents) {
 		if (opt->show_root_diff) {
-			if (is_state)
-				diff_root_state_oid(oid, "", &opt->diffopt);
-			else
-				diff_root_tree_oid(oid, "", &opt->diffopt);
+			diff_root_tree_oid(oid, "", &opt->diffopt);
 			log_tree_diff_flush(opt);
 		}
 		return !opt->loginfo;
@@ -1255,31 +1255,19 @@ static int log_tree_diff(struct rev_info *opt, struct commit *commit, struct log
 	showed_log = 0;
 	for (;;) {
 		struct commit *parent = parents->item;
-		struct object_id *parent_oid;
-		int parent_is_state = parent->is_state_commit;
 
 		parse_commit_or_die(parent);
 		
-		if (parent_is_state) {
-			parent_oid = get_commit_state_oid(parent);
-		} else {
-			parent_oid = get_commit_tree_oid(parent);
+		/* Reject state commits in diff output */
+		if (parent->is_state_commit || commit->is_state_commit) {
+			fprintf(opt->diffopt.file,
+				"diff: mixed-root (state/tree) or state-to-state diff "
+				"not yet supported\n");
+			return 0;
 		}
 		
-		if (is_state && parent_is_state) {
-			/* Both state commits - diff state blobs */
-			diff_state_oid(parent_oid, oid, "", &opt->diffopt);
-		} else if (!is_state && !parent_is_state) {
-			/* Both tree commits - use normal tree diff */
-			diff_tree_oid(parent_oid, oid, "", &opt->diffopt);
-		} else if (is_state && !parent_is_state) {
-			/* State commit with tree parent - show state blob as new file */
-			diff_state_oid(NULL, oid, "", &opt->diffopt);
-		} else {
-			/* Tree commit with state parent - show tree as new, ignoring state parent */
-			diff_root_tree_oid(oid, "", &opt->diffopt);
-		}
-		
+		diff_tree_oid(get_commit_tree_oid(parent),
+			      oid, "", &opt->diffopt);
 		log_tree_diff_flush(opt);
 
 		showed_log |= !opt->loginfo;
