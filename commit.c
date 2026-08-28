@@ -489,6 +489,12 @@ void release_commit_memory(struct parsed_object_pool *pool, struct commit *c)
 	free_commit_buffer(pool, c);
 	c->index = 0;
 	commit_list_free(c->parents);
+	
+	/* Free state OID for experimental state commits */
+	if (c->maybe_state_oid) {
+		free(c->maybe_state_oid);
+		c->maybe_state_oid = NULL;
+	}
 
 	c->object.parsed = 0;
 }
@@ -557,6 +563,11 @@ int parse_commit_buffer(struct repository *r, struct commit *item, const void *b
 				     oid_to_hex(&parent),
 				     oid_to_hex(&item->object.oid));
 		set_commit_tree(item, tree);
+	} else {
+		/* Store state object OID for fsck validation */
+		item->is_state_commit = 1;
+		CALLOC_ARRAY(item->maybe_state_oid, 1);
+		oidcpy(item->maybe_state_oid, &parent);
 	}
 
 	bufptr = eol + 1;

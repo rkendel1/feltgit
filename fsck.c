@@ -406,20 +406,53 @@ static int fsck_walk_commit(struct commit *commit, void *data, struct fsck_optio
 	int res;
 	int result;
 	const char *name;
+	struct object *state_obj;
 
 	if (repo_parse_commit(options->repo, commit))
 		return -1;
 
 	name = fsck_get_object_name(options, &commit->object.oid);
-	if (name)
-		fsck_put_object_name(options, get_commit_tree_oid(commit),
-				     "%s:", name);
+	
+	/* Handle state commits differently from tree commits */
+	if (commit->is_state_commit) {
+		if (!commit->maybe_state_oid) {
+			return report(options, &commit->object.oid, OBJ_COMMIT, 
+				      FSCK_MSG_MISSING_STATE, "state commit missing state object OID");
+		}
+		if (name)
+			fsck_put_object_name(options, commit->maybe_state_oid,
+					     "%s:", name);
+		
+		/* For state commits, validate that the state object exists and is a blob */
+		state_obj = parse_object(options->repo, commit->maybe_state_oid);
+		if (!state_obj) {
+			return report(options, &commit->object.oid, OBJ_COMMIT,
+				      FSCK_MSG_MISSING_STATE, "state object not found");
+		}
+		
+		/* Validate that state object is a blob */
+		if (state_obj->type != OBJ_BLOB) {
+			return report(options, &commit->object.oid, OBJ_COMMIT,
+				      FSCK_MSG_BAD_STATE_TYPE, "state object is not a blob");
+		}
+		
+		/* Walk the state object through the callback */
+		result = options->walk(state_obj, OBJ_BLOB, data, options);
+		if (result < 0)
+			return result;
+		res = result;
+	} else {
+		/* Handle tree commits as before */
+		if (name)
+			fsck_put_object_name(options, get_commit_tree_oid(commit),
+					     "%s:", name);
 
-	result = options->walk((struct object *) repo_get_commit_tree(options->repo, commit),
+		result = options->walk((struct object *) repo_get_commit_tree(options->repo, commit),
 			       OBJ_TREE, data, options);
-	if (result < 0)
-		return result;
-	res = result;
+		if (result < 0)
+			return result;
+		res = result;
+	}
 
 	parents = commit->parents;
 	if (name && parents) {
@@ -951,12 +984,13 @@ static int fsck_commit(const struct object_id *oid,
 		       const char *buffer, unsigned long size,
 		       struct fsck_options *options)
 {
-	struct object_id tree_oid, parent_oid;
+	struct object_id root_oid, parent_oid;
 	unsigned author_count;
 	int err;
 	const char *buffer_begin = buffer;
 	const char *buffer_end = buffer + size;
 	const char *p;
+	int is_state_root = 0;
 
 	/*
 	 * We _must_ stop parsing immediately if this reports failure, as the
@@ -966,10 +1000,22 @@ static int fsck_commit(const struct object_id *oid,
 	if (verify_headers(buffer, size, oid, OBJ_COMMIT, options))
 		return -1;
 
-	if (buffer >= buffer_end || !skip_prefix(buffer, "tree ", &buffer))
-		return report(options, oid, OBJ_COMMIT, FSCK_MSG_MISSING_TREE, "invalid format - expected 'tree' line");
-	if (parse_oid_hex_algop(buffer, &tree_oid, &p, options->repo->hash_algo) || *p != '\n') {
-		err = report(options, oid, OBJ_COMMIT, FSCK_MSG_BAD_TREE_SHA1, "invalid 'tree' line format - bad sha1");
+	if (buffer >= buffer_end)
+		return report(options, oid, OBJ_COMMIT, FSCK_MSG_MISSING_TREE, "invalid format - expected 'tree' or 'state' line");
+
+	/* Check for either "tree " or "state " prefix */
+	if (skip_prefix(buffer, "tree ", &buffer)) {
+		is_state_root = 0;
+	} else if (skip_prefix(buffer, "state ", &buffer)) {
+		is_state_root = 1;
+	} else {
+		return report(options, oid, OBJ_COMMIT, FSCK_MSG_MISSING_TREE, "invalid format - expected 'tree' or 'state' line");
+	}
+
+	if (parse_oid_hex_algop(buffer, &root_oid, &p, options->repo->hash_algo) || *p != '\n') {
+		enum fsck_msg_id msg_id = is_state_root ? FSCK_MSG_BAD_STATE_SHA1 : FSCK_MSG_BAD_TREE_SHA1;
+		const char *error_msg = is_state_root ? "invalid 'state' line format - bad sha1" : "invalid 'tree' line format - bad sha1";
+		err = report(options, oid, OBJ_COMMIT, msg_id, "%s", error_msg);
 		if (err)
 			return err;
 	}
