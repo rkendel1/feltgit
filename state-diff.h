@@ -126,4 +126,74 @@ const char *format_state_deltas(const struct state_deltas *deltas);
  */
 int has_array_at_top_level(const char *data, size_t len);
 
+/*
+ * Three-way reconciliation support
+ *
+ * StateConflict represents a semantic conflict during reconciliation.
+ * This is when both sides change the same path to different values.
+ * The conflict records the path and all three values for human inspection.
+ */
+
+struct state_conflict {
+	char *path;
+	struct state_value *base_value;    /* may be NULL if path absent in base */
+	struct state_value *left_value;    /* may be NULL if path absent in left */
+	struct state_value *right_value;   /* may be NULL if path absent in right */
+};
+
+struct state_conflicts {
+	struct state_conflict *items;
+	size_t count;
+	size_t capacity;
+};
+
+/*
+ * StateReconcileResult represents the output of three-way reconciliation.
+ * Either contains merged_state (if successful) or conflicts (if not).
+ * Both are mutually exclusive - a successful result has no conflicts.
+ */
+
+struct state_reconcile_result {
+	struct state_obj *merged_state;   /* non-NULL if merge succeeded */
+	struct state_conflicts *conflicts; /* non-NULL if merge produced conflicts */
+	int success;                       /* 1 if successful, 0 if conflicted */
+};
+
+/*
+ * Three-way reconciliation of state objects.
+ *
+ * Given a common base state and two derived states (left and right),
+ * produces either:
+ *   - A merged state if all changes are compatible
+ *   - An explicit conflict list if incompatible changes are detected
+ *
+ * Rules applied at each path:
+ * 1. If all three values are equal, use that value
+ * 2. If only left changed, use left
+ * 3. If only right changed, use right
+ * 4. If both changed to the same value, use that value
+ * 5. If both changed differently, report a conflict
+ *
+ * Returns:
+ *   - struct state_reconcile_result with merged_state set (success=1) if no conflicts
+ *   - struct state_reconcile_result with conflicts array set (success=0) if conflicts found
+ *   - NULL on error (e.g., parsing error, invalid input)
+ *
+ * Caller must free result with free_state_reconcile_result().
+ * All three inputs may be NULL (representing empty/absent state).
+ */
+struct state_reconcile_result *reconcile_states(struct state_obj *base,
+					        struct state_obj *left,
+					        struct state_obj *right);
+
+/*
+ * Free all memory associated with reconciliation result.
+ */
+void free_state_reconcile_result(struct state_reconcile_result *result);
+
+/*
+ * Free all memory associated with conflicts array.
+ */
+void free_state_conflicts(struct state_conflicts *conflicts);
+
 #endif
