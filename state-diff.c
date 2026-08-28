@@ -719,8 +719,8 @@ static struct state_value *copy_state_value_recursive(const struct state_value *
 		struct state_object *obj_copy = xmalloc(sizeof(*obj_copy));
 		obj_copy->count = obj->count;
 		obj_copy->capacity = obj->count > 0 ? obj->count : 10;
-		obj_copy->keys = xmalloc(sizeof(char *) * obj_copy->capacity);
-		obj_copy->values = xmalloc(sizeof(struct state_value) * obj_copy->capacity);
+		obj_copy->keys = xcalloc(obj_copy->capacity, sizeof(char *));
+		obj_copy->values = xcalloc(obj_copy->capacity, sizeof(struct state_value));
 
 		for (size_t i = 0; i < obj->count; i++) {
 			obj_copy->keys[i] = xstrdup(obj->keys[i]);
@@ -926,8 +926,8 @@ static int set_value_at_path(struct state_object *root, const char *path,
 				struct state_object *new_obj = xmalloc(sizeof(*new_obj));
 				new_obj->count = 0;
 				new_obj->capacity = 10;
-				new_obj->keys = xmalloc(sizeof(char *) * new_obj->capacity);
-				new_obj->values = xmalloc(sizeof(struct state_value) * new_obj->capacity);
+				new_obj->keys = xcalloc(new_obj->capacity, sizeof(char *));
+				new_obj->values = xcalloc(new_obj->capacity, sizeof(struct state_value));
 
 				current->keys[current->count] = xstrdup(component);
 				current->values[current->count].type = STATE_VALUE_OBJECT;
@@ -1041,8 +1041,8 @@ struct state_reconcile_result *reconcile_states(struct state_obj *base,
 		merged_obj->root = xmalloc(sizeof(struct state_object));
 		merged_obj->root->count = 0;
 		merged_obj->root->capacity = all_paths_count > 0 ? all_paths_count : 10;
-		merged_obj->root->keys = xmalloc(sizeof(char *) * merged_obj->root->capacity);
-		merged_obj->root->values = xmalloc(sizeof(struct state_value) * merged_obj->root->capacity);
+		merged_obj->root->keys = xcalloc(merged_obj->root->capacity, sizeof(char *));
+		merged_obj->root->values = xcalloc(merged_obj->root->capacity, sizeof(struct state_value));
 	}
 
 	/* Reconcile each path */
