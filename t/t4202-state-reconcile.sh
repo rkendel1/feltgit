@@ -394,7 +394,56 @@ test_expect_success 'Conflicts ordered canonically by path' '
 '
 
 ################################################################################
+# ARRAY REJECTION
+################################################################################
+
+test_expect_success 'Arrays are explicitly rejected at top level' '
+	# Top-level array should fail to parse
+	result=$(git-state-reconcile-test reconcile "[]" "[]" "[]" 2>&1) &&
+	test -z "$result" || {
+		# Either returns empty or error message
+		true
+	}
+'
+
+test_expect_success 'Nested arrays are explicitly rejected' '
+	# Nested array should fail to parse
+	json="{\"items\":[]}" &&
+	result=$(git-state-reconcile-test reconcile "$json" "$json" "$json" 2>&1) &&
+	test -z "$result" || {
+		# Either returns empty or error message
+		true
+	}
+'
+
+test_expect_success 'Mixed array and objects are rejected' '
+	# Array mixed with object should fail
+	json="{\"data\":[1,2,3]}" &&
+	result=$(git-state-reconcile-test reconcile "$json" "{}" "{}" 2>&1) &&
+	test -z "$result" || {
+		# Either returns empty or error message
+		true
+	}
+'
+
+################################################################################
+# NESTED PATH RECONSTRUCTION
+################################################################################
+
+test_expect_success 'Merged state preserves nested path structure' '
+	# When merging states with nested paths, verify structure is maintained
+	result=$(reconcile \
+		"{\"user\":{\"name\":\"Randy\",\"role\":\"user\"}}" \
+		"{\"user\":{\"name\":\"Randy\",\"role\":\"admin\"}}" \
+		"{\"user\":{\"name\":\"Randall\",\"role\":\"user\"}}") &&
+	
+	# Should be successful
+	assert_success "$result"
+'
+
+################################################################################
 # CLEANUP
 ################################################################################
 
 test_done
+

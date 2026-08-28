@@ -346,30 +346,97 @@ The following are explicitly **not** addressed by this PR:
 
 ## Test Coverage
 
-The PR includes executable tests for:
+PR #4 includes 30+ executable tests that call the actual `reconcile_states()` function:
 
-1. ✓ Identical states
-2. ✓ Left-only modification
-3. ✓ Right-only modification
-4. ✓ Both modify same path to same value
-5. ✓ Conflicting scalar modification
-6. ✓ Left-only addition
-7. ✓ Right-only addition
-8. ✓ Identical additions
-9. ✓ Conflicting additions
-10. ✓ Left-only removal
-11. ✓ Right-only removal
-12. ✓ Remove vs modify conflict
-13. ✓ Independent nested changes
-14. ✓ Conflicting nested change
-15. ✓ Multiple independent changes
-16. ✓ Deterministic output
-17. ✓ JSON key-order independence
-18. ✓ Invalid JSON rejection
-19. ✓ Missing state object handling
-20. ✓ Tree-root input rejection
-21. ✓ Mixed-root inputs rejection
-22. ✓ End-to-end commit-based reconciliation
+### Proven by Executable Assertions ✅
+
+**Five Reconciliation Rules:**
+1. ✓ RULE 1: Unchanged - identical scalar
+2. ✓ RULE 1: Unchanged - identical complex
+3. ✓ RULE 1: Unchanged - empty objects
+4. ✓ RULE 2: Left only - modify scalar
+5. ✓ RULE 2: Left only - modify nested
+6. ✓ RULE 2: Left only - add property
+7. ✓ RULE 2: Left only - remove property
+8. ✓ RULE 3: Right only - modify scalar
+9. ✓ RULE 3: Right only - modify nested
+10. ✓ RULE 3: Right only - add property
+11. ✓ RULE 3: Right only - remove property
+12. ✓ RULE 4: Both same - identical modification
+13. ✓ RULE 4: Both same - identical nested change
+14. ✓ RULE 4: Both same - identical addition
+15. ✓ RULE 4: Both same - identical removal
+16. ✓ RULE 5: Conflict - both modify to different values
+17. ✓ RULE 5: Conflict - nested modification to different values
+
+**Add/Remove Semantics:**
+18. ✓ Add/Add same: no conflict
+19. ✓ Add/Add different: conflict
+20. ✓ Left add only: success
+21. ✓ Right add only: success
+22. ✓ Left remove only: success
+23. ✓ Right remove only: success
+24. ✓ Remove vs modify: explicit conflict at exact path
+
+**Nested Objects:**
+25. ✓ Independent nested changes: success
+26. ✓ Conflicting nested change: conflict at exact path
+27. ✓ Multiple independent nested changes: success
+28. ✓ Deep nested path independence: success
+
+**Determinism:**
+29. ✓ JSON key order independence: same result
+30. ✓ Deterministic output: byte-for-byte identical on repeated runs
+
+**Conflict Ordering:**
+31. ✓ Conflicts ordered canonically by path
+
+### Not Proven (Known Limitations) ❌
+
+The following are NOT proven by executable tests in PR #4:
+
+- ❌ **Tree-root input rejection** (not implemented)
+  - reconcile_states() accepts arbitrary state_obj* without validation
+  - Cannot distinguish state-root from tree-root commits
+  - Requires commit-level wrapper (future PR)
+
+- ❌ **Mixed tree/state input rejection** (not implemented)
+  - No validation of commit types
+  - Requires commit-level wrapper (future PR)
+
+- ❌ **No objects written** (not tested)
+  - Code inspection shows reconcile_states() doesn't call git_hash_object()
+  - Not verified by test
+
+- ❌ **No refs updated** (not tested)
+  - Code inspection shows no ref update calls
+  - Not verified by test
+
+- ❌ **No commits created** (not tested)
+  - Code inspection shows no commit creation
+  - Not verified by test
+
+- ❌ **Arrays explicitly rejected** (not tested)
+  - Code has array rejection (EINVAL on parse_array)
+  - Not verified by executable test
+
+- ❌ **Nested path reconstruction** (partially tested)
+  - Merged state is created internally
+  - Output format of merged state not inspected by tests
+  - Exact reconstruction of nested paths not verified
+
+### Test Execution
+
+All tests call `git-state-reconcile-test` which:
+1. Parses JSON input using `parse_state_blob()`
+2. Calls `reconcile_states()` with the three parsed states
+3. Outputs JSON result with success/conflicts count
+4. (For dump-conflict command) Outputs full conflict details
+
+Each test uses `assert_success` or `assert_conflict` helper to verify:
+- Whether reconciliation succeeded or failed
+- Exact conflict count
+- Exact conflict paths (where applicable)
 
 ## Conclusion
 

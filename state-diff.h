@@ -196,4 +196,25 @@ void free_state_reconcile_result(struct state_reconcile_result *result);
  */
 void free_state_conflicts(struct state_conflicts *conflicts);
 
+/*
+ * NOTE: Commit-level validation is NOT currently implemented.
+ *
+ * The current reconcile_states() function accepts arbitrary state_obj* pointers
+ * without validating whether they come from state-root commits or tree-root commits.
+ *
+ * This is a known limitation documented in STATE-RECONCILIATION-ASSUMPTIONS.md
+ * as NOT PROVEN item #10:
+ * - Tree-root commits are NOT rejected by the state reconciler
+ * - Mixed tree/state inputs are NOT rejected
+ *
+ * Future work (PR #5 or later) should add:
+ * 1. reconcile_states_from_commits() that validates commit types
+ * 2. Rejection of tree-root commits
+ * 3. Rejection of mixed tree/state inputs
+ *
+ * For now, reconcile_states() is suitable for testing the semantic reconciliation
+ * algorithm itself, but should not be used directly with untrusted commit inputs
+ * without external validation.
+ */
+
 #endif
