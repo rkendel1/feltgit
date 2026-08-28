@@ -841,20 +841,87 @@ static int path_cmp(const void *a, const void *b)
 	return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-static int add_unique_path(char **all_paths, size_t *count, size_t *capacity,
-			   const char *path)
+/* Helper: Set a value at a nested path in a state object
+ * Creates intermediate objects as needed
+ * Path format: "key" or "key/subkey/deeperkey"
+ */
+static int set_value_at_path(struct state_object *root, const char *path,
+			      const struct state_value *value)
 {
-	for (size_t i = 0; i < *count; i++) {
-		if (strcmp(all_paths[i], path) == 0)
-			return 0; /* Already present */
+	char *path_copy = xstrdup(path);
+	char *saveptr = NULL;
+	char *component = strtok_r(path_copy, "/", &saveptr);
+	struct state_object *current = root;
+
+	/* Navigate to parent of target */
+	while (component) {
+		char *next_component = strtok_r(NULL, "/", &saveptr);
+
+		if (!next_component) {
+			/* Last component - set the value */
+			/* Look for existing key */
+			int found = 0;
+			for (size_t i = 0; i < current->count; i++) {
+				if (strcmp(current->keys[i], component) == 0) {
+					/* Update existing */
+					free_state_value(&current->values[i]);
+					current->values[i] = *copy_state_value(value);
+					found = 1;
+					break;
+				}
+			}
+
+			if (!found) {
+				/* Add new key */
+				if (current->count >= current->capacity) {
+					current->capacity = current->capacity > 0 ? current->capacity * 2 : 10;
+					current->keys = xrealloc(current->keys, sizeof(char *) * current->capacity);
+					current->values = xrealloc(current->values, sizeof(struct state_value) * current->capacity);
+				}
+				current->keys[current->count] = xstrdup(component);
+				current->values[current->count] = *copy_state_value(value);
+				current->count++;
+			}
+		} else {
+			/* Intermediate component - navigate or create */
+			int found = 0;
+			for (size_t i = 0; i < current->count; i++) {
+				if (strcmp(current->keys[i], component) == 0) {
+					if (current->values[i].type == STATE_VALUE_OBJECT) {
+						current = current->values[i].value.object_val;
+						found = 1;
+					}
+					break;
+				}
+			}
+
+			if (!found) {
+				/* Create new object */
+				if (current->count >= current->capacity) {
+					current->capacity = current->capacity > 0 ? current->capacity * 2 : 10;
+					current->keys = xrealloc(current->keys, sizeof(char *) * current->capacity);
+					current->values = xrealloc(current->values, sizeof(struct state_value) * current->capacity);
+				}
+
+				struct state_object *new_obj = xmalloc(sizeof(*new_obj));
+				new_obj->count = 0;
+				new_obj->capacity = 10;
+				new_obj->keys = xmalloc(sizeof(char *) * new_obj->capacity);
+				new_obj->values = xmalloc(sizeof(struct state_value) * new_obj->capacity);
+
+				current->keys[current->count] = xstrdup(component);
+				current->values[current->count].type = STATE_VALUE_OBJECT;
+				current->values[current->count].value.object_val = new_obj;
+				current->count++;
+
+				current = new_obj;
+			}
+		}
+
+		component = next_component;
 	}
 
-	if (*count >= *capacity) {
-		*capacity = *capacity > 0 ? *capacity * 2 : 10;
-		all_paths = xrealloc(all_paths, sizeof(char *) * *capacity);
-	}
-	all_paths[*count] = xstrdup(path);
-	(*count)++;
+	free(path_copy);
 	return 0;
 }
 
@@ -1033,24 +1100,8 @@ struct state_reconcile_result *reconcile_states(struct state_obj *base,
 
 		/* Add to merged object if not a conflict */
 		if (!is_conflict && merged_val && merged_obj) {
-			/* For top-level paths (no slashes), add directly to root */
-			if (!strchr(path, '/')) {
-				if (merged_obj->root->count >= merged_obj->root->capacity) {
-					merged_obj->root->capacity *= 2;
-					merged_obj->root->keys = xrealloc(merged_obj->root->keys,
-								sizeof(char *) * merged_obj->root->capacity);
-					merged_obj->root->values = xrealloc(merged_obj->root->values,
-								sizeof(struct state_value) * merged_obj->root->capacity);
-				}
-				merged_obj->root->keys[merged_obj->root->count] = xstrdup(path);
-				merged_obj->root->values[merged_obj->root->count] = *merged_val;
-				merged_obj->root->count++;
-			} else {
-				/* For nested paths, we need to insert into nested structure
-				 * For simplicity, this is a limitation - we flatten on output */
-				/* TODO: Implement nested object reconstruction */
-			}
-
+			/* Use helper function to set value at nested path */
+			set_value_at_path(merged_obj->root, path, merged_val);
 			free_state_value(merged_val);
 		}
 	}
