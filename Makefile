@@ -2899,6 +2899,7 @@ OBJECTS += $(REFTABLE_TEST_OBJS)
 OBJECTS += $(UNIT_TEST_OBJS)
 OBJECTS += $(CLAR_TEST_OBJS)
 OBJECTS += $(patsubst %,$(UNIT_TEST_DIR)/%.o,$(UNIT_TEST_PROGRAMS))
+OBJECTS += git-state-reconcile-test.o
 
 ifdef INCLUDE_LIBGIT_RS
 	OBJECTS += contrib/libgit-sys/public_symbol_export.o
@@ -3029,7 +3030,7 @@ git-http-push$X: http.o http-push.o GIT-LDFLAGS $(GITLIBS)
 		$(CURL_LIBCURL) $(EXPAT_LIBEXPAT) $(LIBS)
 
 git-state-reconcile-test$X: git-state-reconcile-test.o state-diff.o GIT-LDFLAGS $(GITLIBS)
-	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) -o $@ $(ALL_LDFLAGS) $(filter %.o,$^) $(LIBS)
+	$(QUIET_LINK)$(CC) $(ALL_CFLAGS) -o $@ $(ALL_LDFLAGS) git-state-reconcile-test.o state-diff.o libgit.a $(LIBS)
 
 $(REMOTE_CURL_ALIASES): $(REMOTE_CURL_PRIMARY)
 	$(QUIET_LNCP)$(RM) $@ && \
