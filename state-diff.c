@@ -849,17 +849,35 @@ static int set_value_at_path(struct state_object *root, const char *path,
 			      const struct state_value *value)
 {
 	char *path_copy = xstrdup(path);
-	char *saveptr = NULL;
-	char *component = strtok_r(path_copy, "/", &saveptr);
 	struct state_object *current = root;
+	const char *p = path_copy;
+	const char *component_start;
 
-	/* Navigate to parent of target */
-	while (component) {
-		char *next_component = strtok_r(NULL, "/", &saveptr);
+	/* Parse path components manually to avoid banned strtok_r */
+	while (*p) {
+		/* Skip leading '/' */
+		if (*p == '/') {
+			p++;
+			if (!*p) break;  /* Trailing slash */
+		}
 
-		if (!next_component) {
+		/* Find end of component */
+		component_start = p;
+		while (*p && *p != '/') {
+			p++;
+		}
+
+		size_t component_len = p - component_start;
+		if (component_len == 0) {
+			p++;
+			continue;
+		}
+
+		char *component = xstrndup(component_start, component_len);
+		int is_last = (*p == '\0');
+
+		if (is_last) {
 			/* Last component - set the value */
-			/* Look for existing key */
 			int found = 0;
 			for (size_t i = 0; i < current->count; i++) {
 				if (strcmp(current->keys[i], component) == 0) {
@@ -918,7 +936,7 @@ static int set_value_at_path(struct state_object *root, const char *path,
 			}
 		}
 
-		component = next_component;
+		free(component);
 	}
 
 	free(path_copy);

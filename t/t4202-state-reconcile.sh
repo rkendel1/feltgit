@@ -1,347 +1,400 @@
 #!/bin/bash
 #
-# Test script for three-way state reconciliation functionality
-# Tests all 22 required reconciliation scenarios
+# Executable tests for three-way state reconciliation
+# Tests the five reconciliation rules and edge cases with real assertions
 #
 
-set -e
-
-test_description="State reconciliation (three-way merge)"
+test_description="State reconciliation (three-way merge) - Executable Tests"
 
 . ./test-lib.sh
 
-# Helper: Create a git object database entry for a JSON state blob
-# Returns the SHA-1 hash
-make_state_blob() {
-	local json="$1"
-	echo -n "$json" | git hash-object -w --stdin
+# Helper: Call git-state-reconcile-test and parse JSON output
+# Returns: {success: 0/1, conflicts: N}
+reconcile() {
+	local base_json="$1"
+	local left_json="$2"
+	local right_json="$3"
+	git-state-reconcile-test reconcile "$base_json" "$left_json" "$right_json"
 }
 
-# Helper: Create a state commit with explicit state root
-# Requires state-root support in the modified git
-make_state_commit() {
-	local state_oid="$1"
-	local parent="${2:-}"
-	local msg="${3:-State commit}"
-
-	# Create commit with state root using git's commit-tree
-	# For now, create tree with state reference
-	local tree=$(git mktree <<EOF
-100644 blob $state_oid	.feltdb/state
-EOF
-	)
-
-	if [ -z "$parent" ]; then
-		git commit-tree -m "$msg" "$tree"
-	else
-		git commit-tree -m "$msg" -p "$parent" "$tree"
-	fi
+# Helper: Get conflict details
+dump_conflicts() {
+	local base_json="$1"
+	local left_json="$2"
+	local right_json="$3"
+	git-state-reconcile-test dump-conflict "$base_json" "$left_json" "$right_json"
 }
 
-# Test 1: Identical states
-test_expect_success 'Test 1: Identical states (no merge changes needed)' '
-	json="{\"name\":\"Randy\",\"role\":\"user\"}" &&
-	base_blob=$(make_state_blob "$json") &&
-	left_blob=$(make_state_blob "$json") &&
-	right_blob=$(make_state_blob "$json") &&
+# Helper: Assert successful reconciliation with no conflicts
+assert_success() {
+	local result="$1"
+	local test_name="$2"
 	
-	# All three should be identical, reconciliation should produce same state
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+	# Extract success flag and conflicts count from JSON: {"success":1,"conflicts":0}
+	local success=$(echo "$result" | sed 's/.*"success":\([01]\).*/\1/')
+	local conflicts=$(echo "$result" | sed 's/.*"conflicts":\([0-9]*\).*/\1/')
+	
+	test "$success" = "1" || {
+		echo "Expected successful merge, got: $result" >&2
+		return 1
+	}
+	test "$conflicts" = "0" || {
+		echo "Expected 0 conflicts, got $conflicts" >&2
+		return 1
+	}
+}
+
+# Helper: Assert conflict (failure)
+assert_conflict() {
+	local result="$1"
+	local expected_count="$2"
+	local test_name="$3"
+	
+	local success=$(echo "$result" | sed 's/.*"success":\([01]\).*/\1/')
+	local conflicts=$(echo "$result" | sed 's/.*"conflicts":\([0-9]*\).*/\1/')
+	
+	test "$success" = "0" || {
+		echo "Expected conflict, got success" >&2
+		return 1
+	}
+	test "$conflicts" = "$expected_count" || {
+		echo "Expected $expected_count conflicts, got $conflicts" >&2
+		return 1
+	}
+}
+
+################################################################################
+# RULE 1: UNCHANGED
+# Base = X, Left = X, Right = X → success, merged = X, conflicts = 0
+################################################################################
+
+test_expect_success 'RULE 1: Unchanged - identical scalar' '
+	result=$(reconcile "{\"name\":\"Randy\"}" "{\"name\":\"Randy\"}" "{\"name\":\"Randy\"}") &&
+	assert_success "$result"
 '
 
-# Test 2: Left-only modification
-test_expect_success 'Test 2: Left-only modification' '
-	base_json="{\"name\":\"Randy\",\"role\":\"user\"}" &&
-	left_json="{\"name\":\"Randy\",\"role\":\"admin\"}" &&
-	right_json="{\"name\":\"Randy\",\"role\":\"user\"}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+test_expect_success 'RULE 1: Unchanged - identical complex' '
+	json="{\"user\":{\"name\":\"Randy\",\"role\":\"user\"},\"active\":true}" &&
+	result=$(reconcile "$json" "$json" "$json") &&
+	assert_success "$result"
 '
 
-# Test 3: Right-only modification
-test_expect_success 'Test 3: Right-only modification' '
-	base_json="{\"name\":\"Randy\",\"role\":\"user\"}" &&
-	left_json="{\"name\":\"Randy\",\"role\":\"user\"}" &&
-	right_json="{\"name\":\"Randy\",\"role\":\"admin\"}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+test_expect_success 'RULE 1: Unchanged - all empty objects' '
+	result=$(reconcile "{}" "{}" "{}") &&
+	assert_success "$result"
 '
 
-# Test 4: Both modify same path to same value
-test_expect_success 'Test 4: Both modify same path to same value' '
-	base_json="{\"name\":\"Randy\",\"role\":\"user\"}" &&
-	left_json="{\"name\":\"Randy\",\"role\":\"admin\"}" &&
-	right_json="{\"name\":\"Randy\",\"role\":\"admin\"}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+################################################################################
+# RULE 2: LEFT ONLY CHANGED
+# Base = X, Left = Y, Right = X → success, merged = Y, conflicts = 0
+################################################################################
+
+test_expect_success 'RULE 2: Left only - modify scalar' '
+	result=$(reconcile "{\"role\":\"user\"}" "{\"role\":\"admin\"}" "{\"role\":\"user\"}") &&
+	assert_success "$result"
 '
 
-# Test 5: Conflicting scalar modification
-test_expect_success 'Test 5: Conflicting scalar modification (CONFLICT)' '
-	base_json="{\"name\":\"Randy\",\"role\":\"user\"}" &&
-	left_json="{\"name\":\"Randy\",\"role\":\"admin\"}" &&
-	right_json="{\"name\":\"Randy\",\"role\":\"superuser\"}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+test_expect_success 'RULE 2: Left only - modify nested' '
+	result=$(reconcile \
+		"{\"user\":{\"role\":\"user\"}}" \
+		"{\"user\":{\"role\":\"admin\"}}" \
+		"{\"user\":{\"role\":\"user\"}}") &&
+	assert_success "$result"
 '
 
-# Test 6: Left-only addition
-test_expect_success 'Test 6: Left-only addition' '
-	base_json="{\"name\":\"Randy\"}" &&
-	left_json="{\"name\":\"Randy\",\"role\":\"user\"}" &&
-	right_json="{\"name\":\"Randy\"}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+test_expect_success 'RULE 2: Left only - add property' '
+	result=$(reconcile "{}" "{\"new\":\"value\"}" "{}") &&
+	assert_success "$result"
 '
 
-# Test 7: Right-only addition
-test_expect_success 'Test 7: Right-only addition' '
-	base_json="{\"name\":\"Randy\"}" &&
-	left_json="{\"name\":\"Randy\"}" &&
-	right_json="{\"name\":\"Randy\",\"role\":\"user\"}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+test_expect_success 'RULE 2: Left only - remove property' '
+	result=$(reconcile "{\"old\":\"value\"}" "{}" "{\"old\":\"value\"}") &&
+	assert_success "$result"
 '
 
-# Test 8: Both sides add the same value
-test_expect_success 'Test 8: Both sides add the same value (no conflict)' '
-	base_json="{\"name\":\"Randy\"}" &&
-	left_json="{\"name\":\"Randy\",\"active\":true}" &&
-	right_json="{\"name\":\"Randy\",\"active\":true}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+################################################################################
+# RULE 3: RIGHT ONLY CHANGED
+# Base = X, Left = X, Right = Y → success, merged = Y, conflicts = 0
+################################################################################
+
+test_expect_success 'RULE 3: Right only - modify scalar' '
+	result=$(reconcile "{\"role\":\"user\"}" "{\"role\":\"user\"}" "{\"role\":\"admin\"}") &&
+	assert_success "$result"
 '
 
-# Test 9: Both sides add different values
-test_expect_success 'Test 9: Both sides add different values (CONFLICT)' '
-	base_json="{\"name\":\"Randy\"}" &&
-	left_json="{\"name\":\"Randy\",\"active\":true}" &&
-	right_json="{\"name\":\"Randy\",\"active\":false}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+test_expect_success 'RULE 3: Right only - modify nested' '
+	result=$(reconcile \
+		"{\"user\":{\"role\":\"user\"}}" \
+		"{\"user\":{\"role\":\"user\"}}" \
+		"{\"user\":{\"role\":\"admin\"}}") &&
+	assert_success "$result"
 '
 
-# Test 10: Left-only removal
-test_expect_success 'Test 10: Left-only removal' '
-	base_json="{\"name\":\"Randy\",\"active\":true}" &&
-	left_json="{\"name\":\"Randy\"}" &&
-	right_json="{\"name\":\"Randy\",\"active\":true}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+test_expect_success 'RULE 3: Right only - add property' '
+	result=$(reconcile "{}" "{}" "{\"new\":\"value\"}") &&
+	assert_success "$result"
 '
 
-# Test 11: Right-only removal
-test_expect_success 'Test 11: Right-only removal' '
-	base_json="{\"name\":\"Randy\",\"active\":true}" &&
-	left_json="{\"name\":\"Randy\",\"active\":true}" &&
-	right_json="{\"name\":\"Randy\"}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+test_expect_success 'RULE 3: Right only - remove property' '
+	result=$(reconcile "{\"old\":\"value\"}" "{\"old\":\"value\"}" "{}") &&
+	assert_success "$result"
 '
 
-# Test 12: Remove vs modify conflict
-test_expect_success 'Test 12: Remove vs modify conflict (CONFLICT)' '
-	base_json="{\"name\":\"Randy\",\"active\":true}" &&
-	left_json="{\"name\":\"Randy\"}" &&
-	right_json="{\"name\":\"Randy\",\"active\":false}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+################################################################################
+# RULE 4: BOTH CHANGED IDENTICALLY
+# Base = X, Left = Y, Right = Y → success, merged = Y, conflicts = 0
+################################################################################
+
+test_expect_success 'RULE 4: Both same - identical modification' '
+	result=$(reconcile \
+		"{\"role\":\"user\"}" \
+		"{\"role\":\"admin\"}" \
+		"{\"role\":\"admin\"}") &&
+	assert_success "$result"
 '
 
-# Test 13: Independent nested changes
-test_expect_success 'Test 13: Independent nested changes (no conflict)' '
-	base_json="{\"user\":{\"name\":\"Randy\",\"role\":\"user\"}}" &&
-	left_json="{\"user\":{\"name\":\"Randy\",\"role\":\"admin\"}}" &&
-	right_json="{\"user\":{\"name\":\"Randall\",\"role\":\"user\"}}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+test_expect_success 'RULE 4: Both same - identical nested change' '
+	result=$(reconcile \
+		"{\"user\":{\"role\":\"user\"}}" \
+		"{\"user\":{\"role\":\"admin\"}}" \
+		"{\"user\":{\"role\":\"admin\"}}") &&
+	assert_success "$result"
 '
 
-# Test 14: Conflicting nested change
-test_expect_success 'Test 14: Conflicting nested change (CONFLICT)' '
-	base_json="{\"user\":{\"name\":\"Randy\",\"role\":\"user\"}}" &&
-	left_json="{\"user\":{\"name\":\"Randy\",\"role\":\"admin\"}}" &&
-	right_json="{\"user\":{\"name\":\"Randy\",\"role\":\"superuser\"}}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+test_expect_success 'RULE 4: Both same - identical addition' '
+	result=$(reconcile \
+		"{}" \
+		"{\"new\":\"value\"}" \
+		"{\"new\":\"value\"}") &&
+	assert_success "$result"
 '
 
-# Test 15: Multiple independent changes
-test_expect_success 'Test 15: Multiple independent changes' '
-	base_json="{\"a\":1,\"b\":2,\"c\":3}" &&
-	left_json="{\"a\":1,\"b\":20,\"c\":3}" &&
-	right_json="{\"a\":1,\"b\":2,\"c\":30}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+test_expect_success 'RULE 4: Both same - identical removal' '
+	result=$(reconcile \
+		"{\"old\":\"value\"}" \
+		"{}" \
+		"{}") &&
+	assert_success "$result"
 '
 
-# Test 16: Deterministic output (same inputs produce same output)
-# This test would require implementing actual reconciliation logic
-test_expect_success 'Test 16: Deterministic output' '
-	base_json="{\"a\":1,\"b\":2}" &&
-	left_json="{\"a\":1,\"b\":3}" &&
-	right_json="{\"a\":2,\"b\":2}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+################################################################################
+# RULE 5: CONFLICTING CHANGES
+# Base = X, Left = Y, Right = Z, all different → conflict, paths retained
+################################################################################
+
+test_expect_success 'RULE 5: Conflict - both modify to different values' '
+	result=$(reconcile \
+		"{\"role\":\"user\"}" \
+		"{\"role\":\"admin\"}" \
+		"{\"role\":\"superuser\"}") &&
+	assert_conflict "$result" 1
 '
 
-# Test 17: JSON key-order independence
-test_expect_success 'Test 17: JSON key-order independence' '
-	base_json="{\"role\":\"user\",\"name\":\"Randy\"}" &&
-	left_json="{\"name\":\"Randy\",\"role\":\"admin\"}" &&
-	right_json="{\"role\":\"user\",\"name\":\"Randy\"}" &&
+test_expect_success 'RULE 5: Conflict - nested modification to different values' '
+	result=$(reconcile \
+		"{\"user\":{\"role\":\"user\"}}" \
+		"{\"user\":{\"role\":\"admin\"}}" \
+		"{\"user\":{\"role\":\"superuser\"}}") &&
+	assert_conflict "$result" 1 &&
 	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
+	conflicts=$(dump_conflicts \
+		"{\"user\":{\"role\":\"user\"}}" \
+		"{\"user\":{\"role\":\"admin\"}}" \
+		"{\"user\":{\"role\":\"superuser\"}}") &&
 	
-	test -n "$base_blob" &&
-	test -n "$left_blob" &&
-	test -n "$right_blob"
+	# Verify conflict has exact path
+	echo "$conflicts" | grep -q "\"/user/role\"" || {
+		echo "Expected conflict at /user/role, got: $conflicts" >&2
+		return 1
+	}
 '
 
-# Test 18: Invalid JSON rejection
-test_expect_success 'Test 18: Invalid JSON is rejected' '
-	invalid_json="{\"name\":\"Randy\"invalid}" &&
-	
-	# This should fail to create a blob or fail in parsing
-	blob=$(echo -n "$invalid_json" | git hash-object -w --stdin 2>/dev/null) ||
-	test -z "$blob"
+test_expect_success 'RULE 5: Conflict - both add different values' '
+	result=$(reconcile \
+		"{}" \
+		"{\"new\":\"left\"}" \
+		"{\"new\":\"right\"}") &&
+	assert_conflict "$result" 1
 '
 
-# Test 19: Missing state object handling
-# This would need actual reconciliation implementation
-test_expect_success 'Test 19: Missing state object is handled' '
-	# Create a reference to a non-existent object
-	nonexistent_oid="0000000000000000000000000000000000000000" &&
-	test -n "$nonexistent_oid"
+################################################################################
+# ADD/REMOVE SEMANTICS
+################################################################################
+
+test_expect_success 'Add/Add Same: both add identical value' '
+	result=$(reconcile \
+		"{}" \
+		"{\"name\":\"Randy\"}" \
+		"{\"name\":\"Randy\"}") &&
+	assert_success "$result"
 '
 
-# Test 20: Tree-root input rejected
-# This would need implementation that validates commit types
-test_expect_success 'Test 20: Tree-root input is rejected' '
-	# Create a regular tree commit (not state)
-	tree=$(git mktree </dev/null) &&
-	tree_commit=$(git commit-tree -m "Tree commit" "$tree") &&
-	test -n "$tree_commit"
+test_expect_success 'Add/Add Different: both add different values (conflict)' '
+	result=$(reconcile \
+		"{}" \
+		"{\"name\":\"Randy\"}" \
+		"{\"name\":\"Randall\"}") &&
+	assert_conflict "$result" 1
 '
 
-# Test 21: Mixed-root inputs rejected
-test_expect_success 'Test 21: Mixed-root inputs are rejected' '
-	state_json="{\"name\":\"Randy\"}" &&
-	state_blob=$(make_state_blob "$state_json") &&
-	test -n "$state_blob"
+test_expect_success 'Left Add Only: left adds, right unchanged' '
+	result=$(reconcile \
+		"{}" \
+		"{\"new\":\"left\"}" \
+		"{}") &&
+	assert_success "$result"
 '
 
-# Test 22: End-to-end commit-based reconciliation
-test_expect_success 'Test 22: End-to-end commit-based reconciliation' '
-	base_json="{\"name\":\"Randy\",\"role\":\"user\"}" &&
-	left_json="{\"name\":\"Randy\",\"role\":\"admin\"}" &&
-	right_json="{\"name\":\"Randall\",\"role\":\"user\"}" &&
-	
-	base_blob=$(make_state_blob "$base_json") &&
-	left_blob=$(make_state_blob "$left_json") &&
-	right_blob=$(make_state_blob "$right_json") &&
-	
-	base_commit=$(make_state_commit "$base_blob") &&
-	left_commit=$(make_state_commit "$left_blob" "$base_commit") &&
-	right_commit=$(make_state_commit "$right_blob" "$base_commit") &&
-	
-	test -n "$base_commit" &&
-	test -n "$left_commit" &&
-	test -n "$right_commit"
+test_expect_success 'Right Add Only: right adds, left unchanged' '
+	result=$(reconcile \
+		"{}" \
+		"{}" \
+		"{\"new\":\"right\"}") &&
+	assert_success "$result"
 '
+
+test_expect_success 'Left Remove Only: left removes, right unchanged' '
+	result=$(reconcile \
+		"{\"old\":\"value\"}" \
+		"{}" \
+		"{\"old\":\"value\"}") &&
+	assert_success "$result"
+'
+
+test_expect_success 'Right Remove Only: right removes, left unchanged' '
+	result=$(reconcile \
+		"{\"old\":\"value\"}" \
+		"{\"old\":\"value\"}" \
+		"{}") &&
+	assert_success "$result"
+'
+
+test_expect_success 'Remove vs Modify: left removes, right modifies (conflict)' '
+	result=$(reconcile \
+		"{\"x\":\"base\"}" \
+		"{}" \
+		"{\"x\":\"changed\"}") &&
+	assert_conflict "$result" 1 &&
+	
+	conflicts=$(dump_conflicts \
+		"{\"x\":\"base\"}" \
+		"{}" \
+		"{\"x\":\"changed\"}") &&
+	
+	# Verify exact path
+	echo "$conflicts" | grep -q "\"/x\"" || {
+		echo "Expected conflict at /x, got: $conflicts" >&2
+		return 1
+	}
+'
+
+################################################################################
+# NESTED OBJECT TESTS
+################################################################################
+
+test_expect_success 'Independent nested changes: modify different paths' '
+	result=$(reconcile \
+		"{\"user\":{\"name\":\"Randy\",\"role\":\"user\"}}" \
+		"{\"user\":{\"name\":\"Randy\",\"role\":\"admin\"}}" \
+		"{\"user\":{\"name\":\"Randall\",\"role\":\"user\"}}") &&
+	assert_success "$result"
+'
+
+test_expect_success 'Conflicting nested change: same path modified differently' '
+	result=$(reconcile \
+		"{\"user\":{\"name\":\"Randy\",\"role\":\"user\"}}" \
+		"{\"user\":{\"name\":\"Randy\",\"role\":\"admin\"}}" \
+		"{\"user\":{\"name\":\"Randy\",\"role\":\"superuser\"}}") &&
+	assert_conflict "$result" 1 &&
+	
+	conflicts=$(dump_conflicts \
+		"{\"user\":{\"name\":\"Randy\",\"role\":\"user\"}}" \
+		"{\"user\":{\"name\":\"Randy\",\"role\":\"admin\"}}" \
+		"{\"user\":{\"name\":\"Randy\",\"role\":\"superuser\"}}") &&
+	
+	# Verify conflict at exact nested path
+	echo "$conflicts" | grep -q "\"/user/role\"" || {
+		echo "Expected conflict at /user/role, got: $conflicts" >&2
+		return 1
+	}
+'
+
+test_expect_success 'Multiple independent nested changes' '
+	result=$(reconcile \
+		"{\"a\":{\"x\":1},\"b\":{\"y\":2}}" \
+		"{\"a\":{\"x\":10},\"b\":{\"y\":2}}" \
+		"{\"a\":{\"x\":1},\"b\":{\"y\":20}}") &&
+	assert_success "$result"
+'
+
+test_expect_success 'Deep nested path independence' '
+	result=$(reconcile \
+		"{\"a\":{\"b\":{\"c\":{\"d\":1}}}}" \
+		"{\"a\":{\"b\":{\"c\":{\"d\":10}}}}" \
+		"{\"a\":{\"b\":{\"c\":{\"e\":20}}}}") &&
+	assert_success "$result"
+'
+
+################################################################################
+# KEY ORDER INVARIANCE
+################################################################################
+
+test_expect_success 'JSON key order independence: different key order produces same result' '
+	# Create base states with different key orders but identical semantics
+	result1=$(reconcile \
+		"{\"role\":\"user\",\"name\":\"Randy\"}" \
+		"{\"name\":\"Randy\",\"role\":\"admin\"}" \
+		"{\"role\":\"user\",\"name\":\"Randy\"}") &&
+	
+	result2=$(reconcile \
+		"{\"name\":\"Randy\",\"role\":\"user\"}" \
+		"{\"role\":\"admin\",\"name\":\"Randy\"}" \
+		"{\"name\":\"Randy\",\"role\":\"user\"}") &&
+	
+	assert_success "$result1" &&
+	assert_success "$result2" &&
+	test "$result1" = "$result2"
+'
+
+test_expect_success 'Deterministic output: repeated reconciliation produces identical results' '
+	base="{\"a\":1,\"b\":2}" &&
+	left="{\"a\":10,\"b\":2}" &&
+	right="{\"a\":1,\"b\":20}" &&
+	
+	result1=$(reconcile "$base" "$left" "$right") &&
+	result2=$(reconcile "$base" "$left" "$right") &&
+	result3=$(reconcile "$base" "$left" "$right") &&
+	
+	test "$result1" = "$result2" &&
+	test "$result2" = "$result3"
+'
+
+################################################################################
+# DETERMINISTIC CONFLICT ORDER
+################################################################################
+
+test_expect_success 'Conflicts ordered canonically by path' '
+	# Create state with multiple simultaneous conflicts
+	conflicts=$(dump_conflicts \
+		"{\"z\":\"z0\",\"a\":\"a0\",\"m\":{\"x\":\"x0\"}}" \
+		"{\"z\":\"z1\",\"a\":\"a1\",\"m\":{\"x\":\"x1\"}}" \
+		"{\"z\":\"z2\",\"a\":\"a2\",\"m\":{\"x\":\"x2\"}}") &&
+	
+	# Extract paths from JSON conflicts array
+	paths=$(echo "$conflicts" | grep -o "\"/[^\"]*\"" | head -3) &&
+	
+	# Verify they are sorted: /a, /m/x, /z
+	first_path=$(echo "$paths" | sed -n 1p) &&
+	second_path=$(echo "$paths" | sed -n 2p) &&
+	third_path=$(echo "$paths" | sed -n 3p) &&
+	
+	test "$first_path" = '"/a"' &&
+	test "$second_path" = '"/m/x"' &&
+	test "$third_path" = '"/z"'
+'
+
+################################################################################
+# CLEANUP
+################################################################################
 
 test_done
