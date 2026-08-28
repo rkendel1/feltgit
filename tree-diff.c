@@ -755,13 +755,11 @@ void diff_state_oid(const struct object_id *old_oid,
 
 	/* Fill in the OIDs and blob mode */
 	if (old_oid) {
-		oidcpy(&old_spec->oid, old_oid);
-		old_spec->mode = S_IFREG | 0644;
+		fill_filespec(old_spec, old_oid, 1, S_IFREG | 0644);
 	}
 
 	if (new_oid) {
-		oidcpy(&new_spec->oid, new_oid);
-		new_spec->mode = S_IFREG | 0644;
+		fill_filespec(new_spec, new_oid, 1, S_IFREG | 0644);
 	}
 
 	/* Create and queue the diff pair */
