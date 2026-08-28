@@ -222,13 +222,6 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	if (strcmp(argv[1], "validate-commit") == 0 && argc == 3) {
-		/* validate-commit <oid>: Validate a commit is a state-root commit */
-		/* This validates the repository isolation property */
-		printf("NOT-IMPLEMENTED\n");
-		return 0;
-	}
-
 	fprintf(stderr, "Unknown command: %s\n", argv[1]);
 	return 1;
 }

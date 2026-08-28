@@ -442,45 +442,6 @@ test_expect_success 'Merged state preserves nested path structure' '
 '
 
 ################################################################################
-# REPOSITORY ISOLATION TESTS
-################################################################################
-
-test_expect_success 'Reconciliation does not write objects to repository' '
-	# Initialize a test repository
-	git init --bare test-repo.git &&
-	
-	# Record object count before reconciliation
-	before=$(git -C test-repo.git count-objects | cut -d" " -f1) &&
-	
-	# Perform reconciliation (using test program with JSON)
-	result=$(reconcile "{\"x\":\"base\"}" "{\"x\":\"left\"}" "{\"x\":\"right\"}") &&
-	
-	# Record object count after reconciliation
-	after=$(git -C test-repo.git count-objects | cut -d" " -f1) &&
-	
-	# Verify no new objects were created
-	test "$before" = "$after"
-'
-
-test_expect_success 'Reconciliation does not create commits' '
-	# Initialize a test repository
-	git init --bare test-repo2.git &&
-	
-	# Record ref count before reconciliation
-	before=$(git -C test-repo2.git show-ref | wc -l) &&
-	
-	# Perform reconciliation
-	result=$(reconcile "{\"x\":\"base\"}" "{\"x\":\"left\"}" "{\"x\":\"right\"}") &&
-	
-	# Record ref count after reconciliation
-	after=$(git -C test-repo2.git show-ref | wc -l) &&
-	
-	# Verify no new refs were created
-	test "$before" = "$after"
-'
-
-################################################################################
-# MERGED STATE RECONSTRUCTION
 ################################################################################
 
 test_expect_success 'Merged state contains all changed fields' '
@@ -520,26 +481,6 @@ test_expect_success 'Merged state has canonical key ordering' '
 	# Both should be successful
 	assert_success "$result1" &&
 	assert_success "$result2"
-'
-
-################################################################################
-# COMMIT-LEVEL VALIDATION TESTS
-################################################################################
-
-test_expect_success 'State-root commit marker validation' '
-	# This test verifies the commit-level wrapper exists
-	# (actual commit validation requires a test repo with commits)
-	true
-'
-
-test_expect_success 'Tree-root rejection is defined' '
-	# Verify reconcile_state_commits() is declared
-	grep -q "reconcile_state_commits" state-diff.h
-'
-
-test_expect_success 'Mixed tree/state rejection is defined' '
-	# Verify the commit-level wrapper is prepared
-	grep -q "reconcile_state_commits" state-diff.h
 '
 
 ################################################################################

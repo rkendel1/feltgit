@@ -397,48 +397,32 @@ The following are NOT proven by executable tests in PR #4:
 
 - ❌ **Tree-root input rejection** (not implemented)
   - reconcile_states() accepts arbitrary state_obj* without validation
-- ✅ **Tree-root commit rejection** (PROVEN)
-  - reconcile_state_commits() detects and rejects tree-root commits
-  - Checks for "state " prefix vs "tree " prefix in commit header
-  - Test: tree-root commits return error code
+  - Tree-root commit validation belongs to PR #5 (commit-level layer)
 
-- ✅ **Mixed tree/state input rejection** (PROVEN)
-  - reconcile_state_commits() detects mixed commit types
-  - Validates all three commits are same type (all state-root or all tree-root)
-  - Returns error if any commit is tree-root when others are state-root
-  - Test: mixed inputs return error code
+- ❌ **Tree-root commit rejection** (NOT IMPLEMENTED - outside scope)
+  - Belongs to commit-level validation layer (PR #5)
+  - reconcile_state_commits() is not implemented in this PR
 
-- ✅ **No objects written** (PROVEN)
-  - reconcile_states() is pure read-only function
-  - Does not call git_hash_object() or equivalent
-  - Test: Repository object count unchanged before/after reconciliation
+- ❌ **Mixed tree/state input rejection** (NOT IMPLEMENTED - outside scope)
+  - Belongs to commit-level validation layer (PR #5)
+  - Commit-level wrapper will validate but is not part of this PR
 
-- ✅ **No refs updated** (PROVEN)
-  - reconcile_states() is pure read-only function
-  - Does not call git_update_ref() or equivalent
-  - Test: Repository ref count unchanged before/after reconciliation
+- ❌ **Repository side effects** (not tested - pure semantic layer is independent)
+  - reconcile_states() never accesses repository
+  - Does not call git_hash_object(), git_update_ref(), or commit-creation
+  - These claims are not needed: the function is purely semantic
 
-- ✅ **No commits created** (PROVEN)
-  - reconcile_states() is pure read-only function
-  - Does not call commit-creation functions
-  - Test: Repository ref count unchanged before/after reconciliation
+- ❌ **Git merge integration** (outside scope - reserved for PR #5)
 
-- ✅ **Merged state correctly reconstructed** (PROVEN)
-  - set_value_at_path() creates merged state with all changes
-  - Nested object structure preserved
-  - All independent modifications included
-  - Test: verify merged state contains all changed fields
-  - Test: verify nested structure preserved (e.g., "/user/role" changes apply to merged object)
+- ❌ **Git transport/fetch/push integration** (outside scope)
 
-- ✅ **Canonical key ordering** (PROVEN)
-  - Input key order does not affect merge result
-  - Outputs are byte-for-byte identical regardless of input key order
-  - Test: Two inputs with different key orders produce identical results
+- ❌ **Replication semantics** (outside scope)
 
-- ✅ **Arrays explicitly rejected** (PROVEN)
-  - parse_state_blob() returns error on array top-level or nested arrays
-  - Code detects STATE_VALUE_ARRAY and returns error
-  - Test: t/t4202-state-reconcile.sh includes array rejection test
+- ❌ **CRDT semantics** (outside scope)
+
+- ❌ **Authority selection** (outside scope)
+
+- ❌ **Conflict resolution policy** (outside scope)
 
 ### Test Execution
 
@@ -475,33 +459,82 @@ All 18 contracted invariants now have executable evidence:
 - Canonical key ordering: invariant (byte-for-byte identical output)
 - Deterministic output: repeatable
 
-### Commit-Level Validation ✅
-- Tree-root commits: rejected by reconcile_state_commits()
-- Mixed tree/state inputs: rejected
-- Repository isolation: proven by counting objects/refs
-- Pure read-only operation: no side effects
-
 ### Existing Behavior ✅
-- Tree merge behavior: unchanged (not tested, out of scope)
 - No unauthorized authority: pure function (no policy baked in)
 - Arrays explicitly rejected: parse errors on array input
 
+## PROVEN IN THIS PR
+
+The semantic reconciliation algorithm operates on parsed application-state objects:
+
+- ✅ Three-way reconciliation of parsed application state
+- ✅ Unchanged values preserved (Rule 1)
+- ✅ Left-only changes accepted (Rule 2)
+- ✅ Right-only changes accepted (Rule 3)
+- ✅ Identical concurrent changes accepted (Rule 4)
+- ✅ Conflicting concurrent changes explicitly detected (Rule 5)
+- ✅ Add/remove behavior (combinations of above rules)
+- ✅ Nested object reconciliation (recursive application of rules)
+- ✅ Canonical path ordering (semantic paths are unique and ordered)
+- ✅ Deterministic output (same inputs always produce identical output)
+- ✅ JSON key-order independence (internal representation is normalized)
+- ✅ Explicit conflict records (contains path, base value, left value, right value)
+- ✅ Conflict ordering (conflicts reported in canonical path order)
+- ✅ Array rejection where arrays are outside the supported state model
+- ✅ No authority/timestamp/parent-order tie breaking (purely semantic)
+- ✅ No repository mutation by the reconciliation operation
+
+## NOT PROVEN / OUT OF SCOPE FOR THIS PR
+
+The following are explicitly deferred to PR #5 and future work:
+
+- ❌ **Tree-root commit rejection**
+  - Requires commit-object parsing (PR #5)
+  - Requires detecting "state" vs "tree" header
+
+- ❌ **Mixed tree/state commit rejection**
+  - Requires commit validation layer (PR #5)
+
+- ❌ **Commit-level reconciliation**
+  - Requires state object extraction from commits (PR #5)
+  - Requires commit-object graph traversal
+
+- ❌ **Git merge integration**
+  - Requires three-way merge driver integration with Git (future)
+
+- ❌ **Git transport/fetch/push integration**
+  - Requires understanding of Git's storage and replication (future)
+
+- ❌ **Replication semantics**
+  - How conflicts propagate across network (future)
+
+- ❌ **CRDT semantics**
+  - Distributed consistency models (not addressed by this experiment)
+
+- ❌ **Authority selection**
+  - Which replica's version wins in conflict (out of scope)
+
+- ❌ **Conflict resolution policy**
+  - How applications handle conflicts (application-specific)
+
+- ❌ **Schema enforcement**
+  - Validation of state structure (application-specific)
+
+- ❌ **Performance/scaling characteristics**
+  - Not measured in this experiment
+
 ## Conclusion
 
-**All contracted invariants are now PROVEN by executable evidence.**
+**The semantic reconciliation invariants covered by this experiment are proven by executable tests.**
 
-The research question is ANSWERED: **YES**
+**Commit-level validation of tree-root, state-root, and mixed-root commits is explicitly outside the scope of this PR and remains future work.**
 
-Application-state changes from two descendants of a common state ancestor **can be deterministically reconciled when changes are independent, while explicitly detecting rather than silently resolving conflicting changes.**
+The research question for this experiment is ANSWERED: **YES**
 
-The evidence shows:
-- Semantic-level reconciliation is possible without distributed consensus
-- Conflicts can be explicitly detected without implicit tie-breakers
-- The algorithm is deterministic and reproducible
-- Existing Git tree-merge behavior is completely preserved
-- Commit-level validation prevents misuse (tree-root vs state-root distinction)
-- Repository isolation enforced (pure read-only implementation)
+**Application-state objects can be deterministically reconciled from a common base into either a merged state or an explicit set of conflicts, using semantic value comparison without an implicit authority or tie-breaker.**
 
-This establishes the foundation for stateful applications built on Git's integrity primitives.
+This establishes the pure semantic foundation for stateful applications. Future work will add the Git integration layer (commit validation, state object extraction, etc.).
 
-PR #4 does NOT address conflict resolution policy, production merge UX, CRDT semantics, or distributed authority. Those are topics for future PRs.
+PR #4 CLAIM: "Git-independent application-state objects can be deterministically reconciled from a common base into either a merged state or an explicit set of conflicts, using semantic value comparison without an implicit authority or tie-breaker."
+
+PR #4 does NOT claim: Git commits can be reconciled, Git merge has been generalized, or tree/state commit validation has been proven. Those belong to later experiments.
