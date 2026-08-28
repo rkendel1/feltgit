@@ -530,6 +530,11 @@ void diff_tree_oid(const struct object_id *old_oid,
 		   const char *base, struct diff_options *opt);
 void diff_root_tree_oid(const struct object_id *new_oid, const char *base,
 			struct diff_options *opt);
+void diff_state_oid(const struct object_id *old_oid,
+		   const struct object_id *new_oid,
+		   const char *base, struct diff_options *opt);
+void diff_root_state_oid(const struct object_id *new_oid, const char *base,
+			struct diff_options *opt);
 
 struct combine_diff_path {
 	struct combine_diff_path *next;

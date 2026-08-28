@@ -1192,6 +1192,7 @@ static int log_tree_diff(struct rev_info *opt, struct commit *commit, struct log
 	struct object_id *oid;
 	int is_merge;
 	int all_need_diff = opt->diff || opt->diffopt.flags.exit_with_status;
+	int is_state = commit->is_state_commit;
 
 	if (!all_need_diff && !opt->merges_need_diff)
 		return 0;
@@ -1203,7 +1204,12 @@ static int log_tree_diff(struct rev_info *opt, struct commit *commit, struct log
 	}
 
 	parse_commit_or_die(commit);
-	oid = get_commit_tree_oid(commit);
+	
+	if (is_state) {
+		oid = get_commit_state_oid(commit);
+	} else {
+		oid = get_commit_tree_oid(commit);
+	}
 
 	parents = get_saved_parents(opt, commit);
 	is_merge = parents && parents->next;
@@ -1213,7 +1219,10 @@ static int log_tree_diff(struct rev_info *opt, struct commit *commit, struct log
 	/* Root commit? */
 	if (!parents) {
 		if (opt->show_root_diff) {
-			diff_root_tree_oid(oid, "", &opt->diffopt);
+			if (is_state)
+				diff_root_state_oid(oid, "", &opt->diffopt);
+			else
+				diff_root_tree_oid(oid, "", &opt->diffopt);
 			log_tree_diff_flush(opt);
 		}
 		return !opt->loginfo;
@@ -1246,10 +1255,29 @@ static int log_tree_diff(struct rev_info *opt, struct commit *commit, struct log
 	showed_log = 0;
 	for (;;) {
 		struct commit *parent = parents->item;
+		struct object_id *parent_oid;
+		int parent_is_state = parent->is_state_commit;
 
 		parse_commit_or_die(parent);
-		diff_tree_oid(get_commit_tree_oid(parent),
-			      oid, "", &opt->diffopt);
+		
+		if (parent_is_state) {
+			parent_oid = get_commit_state_oid(parent);
+		} else {
+			parent_oid = get_commit_tree_oid(parent);
+		}
+		
+		if (is_state && parent_is_state) {
+			diff_state_oid(parent_oid, oid, "", &opt->diffopt);
+		} else if (!is_state && !parent_is_state) {
+			diff_tree_oid(parent_oid, oid, "", &opt->diffopt);
+		} else if (is_state && !parent_is_state) {
+			/* State commit with tree parent - show state blob as modified */
+			diff_state_oid(NULL, oid, "", &opt->diffopt);
+		} else {
+			/* Tree commit with state parent - show tree as modified from state */
+			diff_tree_oid(parent_oid, oid, "", &opt->diffopt);
+		}
+		
 		log_tree_diff_flush(opt);
 
 		showed_log |= !opt->loginfo;

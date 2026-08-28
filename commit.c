@@ -483,6 +483,13 @@ struct object_id *get_commit_tree_oid(const struct commit *commit)
 	return tree ? &tree->object.oid : NULL;
 }
 
+struct object_id *get_commit_state_oid(const struct commit *commit)
+{
+	if (commit->is_state_commit)
+		return commit->maybe_state_oid;
+	return NULL;
+}
+
 void release_commit_memory(struct parsed_object_pool *pool, struct commit *c)
 {
 	set_commit_tree(c, NULL);
