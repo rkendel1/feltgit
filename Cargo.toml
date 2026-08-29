@@ -8,3 +8,15 @@ rust-version = "1.49.0"
 crate-type = ["staticlib"]
 
 [dependencies]
+serde = { version = "1.0", features = ["derive"], default-features = false, optional = true }
+serde_json = { version = "1.0", features = ["alloc"], default-features = false, optional = true }
+sha2 = { version = "0.10", features = ["std"], default-features = false, optional = true }
+hex = { version = "0.4", default-features = false, features = ["alloc"], optional = true }
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[features]
+state-history = ["serde", "serde_json", "sha2", "hex"]
+git-integration = []
+default = ["state-history", "git-integration"]
