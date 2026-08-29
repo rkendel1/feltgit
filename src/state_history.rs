@@ -155,6 +155,21 @@ impl CanonicalState {
     }
 
     /// Canonicalize a JSON value by sorting object keys recursively.
+    ///
+    /// CONTRACT: Numeric representations are preserved as-is by serde_json serialization.
+    /// That is:
+    /// - json!(1) serializes as "1"
+    /// - json!(1.0) serializes as "1.0"
+    /// - json!(1e0) serializes as "1e0"
+    /// These produce different canonical JSON strings and thus different StateIds.
+    /// This is a representation-sensitive contract that preserves information.
+    ///
+    /// Type distinctions are always preserved:
+    /// - false vs null vs 0 vs "" all produce distinct StateIds
+    /// - [] vs {} are distinct
+    /// - true vs 1 are distinct
+    ///
+    /// This is the minimal deterministic contract without semantic normalization.
     fn canonicalize_value(value: &Value) -> Result<String, StateHistoryError> {
         match value {
             Value::Object(map) => {
@@ -741,5 +756,554 @@ mod tests {
 
         let all = history.all_revisions();
         assert_eq!(all.len(), 2);
+    }
+
+    // ============================================
+    // GATE 1: CANONICAL IDENTITY - CRITICAL TESTS
+    // ============================================
+
+    #[test]
+    fn test_json_number_representation_sensitivity() {
+        // AUDIT GATE 1: CANONICALIZATION CONTRACT
+        // This test documents the canonical state identity contract:
+        // JSON numeric representations are preserved as-is by serde_json.
+        // Therefore, different JSON representations produce DIFFERENT StateIds.
+        // This is a representation-sensitive (not semantic-normalized) contract.
+        
+        let state1 = json!({"value": 1});
+        let state2 = json!({"value": 1.0});
+        
+        let canonical1 = CanonicalState::from_json(&state1).unwrap();
+        let canonical2 = CanonicalState::from_json(&state2).unwrap();
+        
+        // serde_json preserves JSON representation: 1 vs 1.0
+        // Therefore canonical JSON strings are different
+        assert_ne!(
+            canonical1.as_str(),
+            canonical2.as_str(),
+            "JSON representations 1 and 1.0 must have different canonical forms"
+        );
+        
+        let id1 = calculate_state_id(&canonical1);
+        let id2 = calculate_state_id(&canonical2);
+        
+        // Different canonical strings → different hashes → different state_ids
+        assert_ne!(
+            id1, id2,
+            "1 and 1.0 produce different state_ids per representation-sensitive contract"
+        );
+    }
+
+    #[test]
+    fn test_json_deterministic_repeated_calculation() {
+        // AUDIT GATE 1: Determinism within the chosen contract
+        // Same JSON representation must always produce identical StateId
+        let state = json!({"value": 1.0});
+        
+        let canonical1 = CanonicalState::from_json(&state).unwrap();
+        let canonical2 = CanonicalState::from_json(&state).unwrap();
+        
+        // Same representation must produce identical bytes
+        assert_eq!(
+            canonical1.as_bytes(),
+            canonical2.as_bytes(),
+            "Repeated canonicalization must produce byte-identical output"
+        );
+        
+        let id1 = calculate_state_id(&canonical1);
+        let id2 = calculate_state_id(&canonical2);
+        
+        // Same input → identical output (determinism)
+        assert_eq!(
+            id1, id2,
+            "Repeated state_id calculation must be deterministic for same input"
+        );
+    }
+
+    #[test]
+    fn test_json_object_key_ordering_irrelevant() {
+        // AUDIT GATE 1: Key ordering must not affect state identity
+        let state1 = json!({"name": "Randy", "role": "admin"});
+        let state2 = json!({"role": "admin", "name": "Randy"});
+        
+        let canonical1 = CanonicalState::from_json(&state1).unwrap();
+        let canonical2 = CanonicalState::from_json(&state2).unwrap();
+        
+        // Both must canonicalize to the same form (sorted keys)
+        assert_eq!(
+            canonical1.as_str(),
+            canonical2.as_str(),
+            "Object key order must not affect canonical form"
+        );
+        
+        let id1 = calculate_state_id(&canonical1);
+        let id2 = calculate_state_id(&canonical2);
+        
+        assert_eq!(
+            id1, id2,
+            "Different key ordering must produce identical state_id"
+        );
+    }
+
+    // =====================================================
+    // GATE 2: TYPE/REPRESENTATION SAFETY - CRITICAL TESTS
+    // =====================================================
+
+    #[test]
+    fn test_type_safety_false_vs_null_vs_zero() {
+        // AUDIT GATE 2: Can we distinguish false, null, 0, "" ?
+        // Risk: Falsey values become indistinguishable
+        let state_false = json!({"value": false});
+        let state_null = json!({"value": null});
+        let state_zero = json!({"value": 0});
+        let state_empty = json!({"value": ""});
+        
+        let canonical_false = CanonicalState::from_json(&state_false).unwrap();
+        let canonical_null = CanonicalState::from_json(&state_null).unwrap();
+        let canonical_zero = CanonicalState::from_json(&state_zero).unwrap();
+        let canonical_empty = CanonicalState::from_json(&state_empty).unwrap();
+        
+        let id_false = calculate_state_id(&canonical_false);
+        let id_null = calculate_state_id(&canonical_null);
+        let id_zero = calculate_state_id(&canonical_zero);
+        let id_empty = calculate_state_id(&canonical_empty);
+        
+        // All must be DISTINCT
+        assert_ne!(id_false, id_null, "false and null must have different state_ids");
+        assert_ne!(id_false, id_zero, "false and 0 must have different state_ids");
+        assert_ne!(id_false, id_empty, "false and \"\" must have different state_ids");
+        assert_ne!(id_null, id_zero, "null and 0 must have different state_ids");
+        assert_ne!(id_null, id_empty, "null and \"\" must have different state_ids");
+        assert_ne!(id_zero, id_empty, "0 and \"\" must have different state_ids");
+    }
+
+    #[test]
+    fn test_type_safety_boolean_true_vs_one() {
+        // AUDIT GATE 2: true vs 1 must be distinct
+        let state_true = json!({"value": true});
+        let state_one = json!({"value": 1});
+        
+        let canonical_true = CanonicalState::from_json(&state_true).unwrap();
+        let canonical_one = CanonicalState::from_json(&state_one).unwrap();
+        
+        let id_true = calculate_state_id(&canonical_true);
+        let id_one = calculate_state_id(&canonical_one);
+        
+        assert_ne!(id_true, id_one, "true and 1 must have different state_ids");
+    }
+
+    #[test]
+    fn test_type_safety_empty_array_vs_empty_object() {
+        // AUDIT GATE 2: [] vs {} must be distinct
+        let state_array = json!({"data": []});
+        let state_object = json!({"data": {}});
+        
+        let canonical_array = CanonicalState::from_json(&state_array).unwrap();
+        let canonical_object = CanonicalState::from_json(&state_object).unwrap();
+        
+        let id_array = calculate_state_id(&canonical_array);
+        let id_object = calculate_state_id(&canonical_object);
+        
+        assert_ne!(id_array, id_object, "[] and {{}} must have different state_ids");
+    }
+
+    #[test]
+    fn test_type_safety_string_vs_number_strings() {
+        // AUDIT GATE 2: "123" vs 123 must be distinct
+        let state_string = json!({"value": "123"});
+        let state_number = json!({"value": 123});
+        
+        let canonical_string = CanonicalState::from_json(&state_string).unwrap();
+        let canonical_number = CanonicalState::from_json(&state_number).unwrap();
+        
+        let id_string = calculate_state_id(&canonical_string);
+        let id_number = calculate_state_id(&canonical_number);
+        
+        assert_ne!(id_string, id_number, "\"123\" and 123 must have different state_ids");
+    }
+
+    // ===============================================
+    // GATE 5: DURABILITY - CORRUPTION DETECTION TESTS
+    // ===============================================
+
+    #[test]
+    fn test_corrupted_json_file_rejected() {
+        // AUDIT GATE 5: Verify corrupted persisted records fail explicitly
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("simon").unwrap();
+        
+        {
+            let mut history = StateHistory::new(temp_dir.path(), authority.clone()).unwrap();
+            let state = json!({"data": "test"});
+            let _revision = history.create_revision(&state, None).unwrap();
+        }
+        
+        // Corrupt the persisted file
+        let entries: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        
+        assert_eq!(entries.len(), 1, "Should have one persisted file");
+        let file_path = entries[0].path();
+        
+        // Write invalid JSON
+        std::fs::write(&file_path, "{ invalid json").unwrap();
+        
+        // Attempt to reload should fail explicitly
+        let result = StateHistory::new(temp_dir.path(), authority);
+        assert!(result.is_err(), "Should reject corrupted JSON file");
+        
+        match result {
+            Err(StateHistoryError::DeserializationError(_)) => {
+                // Correct error type
+            }
+            Err(e) => {
+                panic!("Expected DeserializationError, got: {:?}", e);
+            }
+            Ok(_) => {
+                panic!("Should reject corrupted JSON file");
+            }
+        }
+    }
+
+    #[test]
+    fn test_missing_state_id_field_rejected() {
+        // AUDIT GATE 5: Missing required fields must be detected
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("tara").unwrap();
+        
+        {
+            let mut history = StateHistory::new(temp_dir.path(), authority.clone()).unwrap();
+            let state = json!({"data": "test"});
+            let _revision = history.create_revision(&state, None).unwrap();
+        }
+        
+        // Corrupt by removing state_id field
+        let entries: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        
+        let file_path = entries[0].path();
+        let contents = std::fs::read_to_string(&file_path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        json.as_object_mut().unwrap().remove("state_id");
+        
+        std::fs::write(&file_path, json.to_string()).unwrap();
+        
+        // Reload should fail
+        let result = StateHistory::new(temp_dir.path(), authority);
+        assert!(result.is_err(), "Should reject revision with missing state_id");
+    }
+
+    #[test]
+    fn test_invalid_state_id_hex_rejected() {
+        // AUDIT GATE 5: Invalid hex in state_id must be detected
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("uma").unwrap();
+        
+        {
+            let mut history = StateHistory::new(temp_dir.path(), authority.clone()).unwrap();
+            let state = json!({"data": "test"});
+            let _revision = history.create_revision(&state, None).unwrap();
+        }
+        
+        // Corrupt hex in state_id
+        let entries: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        
+        let file_path = entries[0].path();
+        let contents = std::fs::read_to_string(&file_path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        
+        // Set state_id to invalid hex
+        json["state_id"] = json!("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ");
+        
+        std::fs::write(&file_path, json.to_string()).unwrap();
+        
+        // Reload should fail (deserialization or verification)
+        let result = StateHistory::new(temp_dir.path(), authority);
+        assert!(result.is_err(), "Should reject invalid state_id hex format");
+    }
+
+    // ====================================================
+    // GATE 6: DUPLICATE/IDEMPOTENCY SEMANTICS - MORE TESTS
+    // ====================================================
+
+    #[test]
+    fn test_duplicate_with_different_parent_error() {
+        // AUDIT GATE 6: Partial duplicate detection
+        // Same state_id, different parent should error (can't have 2 parents)
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("victor").unwrap();
+        
+        let mut history = StateHistory::new(temp_dir.path(), authority).unwrap();
+        
+        // Create two root revisions with different states
+        let state_a = json!({"id": "a"});
+        let rev_a = history.create_revision(&state_a, None).unwrap();
+        
+        let state_b = json!({"id": "b"});
+        let rev_b = history.create_revision(&state_b, None).unwrap();
+        
+        // Create a child of rev_a
+        let state_child = json!({"parent": "a"});
+        let rev_child = history.create_revision(&state_child, Some(rev_a.state_id)).unwrap();
+        
+        // Try to create identical child with different parent (rev_b)
+        // This should error because state_id already exists with different parent
+        let result = history.create_revision(&state_child, Some(rev_b.state_id));
+        
+        assert!(result.is_err(), "Cannot create same state_id with different parent");
+        match result {
+            Err(StateHistoryError::DuplicateRevision) => {
+                // Expected behavior
+            }
+            _ => {
+                panic!("Expected DuplicateRevision error");
+            }
+        }
+    }
+
+    #[test]
+    fn test_exact_duplicate_idempotent() {
+        // AUDIT GATE 6: Exact duplicate (state + parent + authority) must be idempotent
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("wendy").unwrap();
+        
+        let mut history = StateHistory::new(temp_dir.path(), authority).unwrap();
+        
+        let state = json!({"idempotent": true});
+        let rev1 = history.create_revision(&state, None).unwrap();
+        
+        // Attempt identical creation again
+        let rev2 = history.create_revision(&state, None).unwrap();
+        
+        // Must succeed and return same state_id
+        assert_eq!(rev1.state_id, rev2.state_id, "Duplicate must be idempotent");
+        assert_eq!(rev1, rev2, "Duplicate revisions must be identical");
+    }
+
+    // ============================================================
+    // GATE 7: STORAGE INVARIANTS - PARENT REFERENCE INTEGRITY TESTS
+    // ============================================================
+
+    #[test]
+    fn test_parent_reference_persisted_correctly() {
+        // AUDIT GATE 7: Verify parent references are stored and retrieved correctly
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("xavier").unwrap();
+        
+        let parent_id = {
+            let mut history = StateHistory::new(temp_dir.path(), authority.clone()).unwrap();
+            let state1 = json!({"step": 1});
+            let rev1 = history.create_revision(&state1, None).unwrap();
+            rev1.state_id
+        };
+        
+        {
+            let mut history = StateHistory::new(temp_dir.path(), authority.clone()).unwrap();
+            let state2 = json!({"step": 2});
+            let _rev2 = history.create_revision(&state2, Some(parent_id)).unwrap();
+        }
+        
+        // Close and reopen
+        let history3 = StateHistory::new(temp_dir.path(), authority).unwrap();
+        let all_revs = history3.all_revisions();
+        
+        assert_eq!(all_revs.len(), 2, "Both revisions should be loaded");
+        
+        let rev2 = all_revs.iter().find(|r| r.parent.is_some()).unwrap();
+        assert_eq!(
+            rev2.parent,
+            Some(parent_id),
+            "Parent reference must be persisted and restored exactly"
+        );
+    }
+
+    #[test]
+    fn test_storage_file_format_contains_all_fields() {
+        // AUDIT GATE 7: Inspect on-disk format to verify completeness
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("yolanda").unwrap();
+        
+        {
+            let mut history = StateHistory::new(temp_dir.path(), authority).unwrap();
+            let state = json!({"format": "check"});
+            let revision = history.create_revision(&state, None).unwrap();
+            
+            // Save state_id for verification
+            let expected_state_id = revision.state_id.to_hex();
+            
+            // Verify file was created with correct name
+            let file_path = temp_dir.path().join(&expected_state_id);
+            assert!(file_path.exists(), "File should exist with state_id as hex name");
+            
+            // Read and verify content
+            let contents = std::fs::read_to_string(&file_path).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+            
+            // Verify all required fields are persisted
+            assert!(json.get("state_id").is_some(), "state_id must be in persisted file");
+            assert!(json.get("authority").is_some(), "authority must be in persisted file");
+            assert!(json.get("state").is_some(), "state must be in persisted file");
+            assert!(json.get("parent").is_some(), "parent must be in persisted file");
+            
+            // Verify state is the correct canonical form
+            let persisted_state = json["state"].as_str().unwrap();
+            assert_eq!(
+                persisted_state,
+                r#"{"format":"check"}"#,
+                "Persisted state must be canonical JSON"
+            );
+        }
+    }
+
+    // ================================================
+    // GATE 3: REVISION SEMANTICS - ORPHAN DETECTION
+    // ================================================
+
+    #[test]
+    fn test_orphan_detection_parent_deleted() {
+        // AUDIT GATE 3: Can we detect orphaned revisions?
+        // Note: Current implementation doesn't prevent this at creation time
+        // This test documents the current behavior
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("zoe").unwrap();
+        
+        let parent_id = {
+            let mut history = StateHistory::new(temp_dir.path(), authority.clone()).unwrap();
+            let state = json!({"step": 1});
+            let rev = history.create_revision(&state, None).unwrap();
+            rev.state_id
+        };
+        
+        // Create child that references parent
+        {
+            let mut history = StateHistory::new(temp_dir.path(), authority.clone()).unwrap();
+            let state = json!({"step": 2});
+            let _rev = history.create_revision(&state, Some(parent_id)).unwrap();
+        }
+        
+        // Try to manually delete the parent file and reload
+        let entries: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        
+        // Find and remove parent file
+        for entry in entries {
+            let path = entry.path();
+            let file_name = path.file_name().unwrap().to_str().unwrap();
+            if file_name == parent_id.to_hex() {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+        
+        // Reload - child still exists but references missing parent
+        let history_reloaded = StateHistory::new(temp_dir.path(), authority).unwrap();
+        let all_revs = history_reloaded.all_revisions();
+        
+        let child_rev = all_revs.iter().find(|r| r.parent.is_some()).unwrap();
+        
+        // Verify parent doesn't exist in storage
+        let parent_exists = all_revs.iter().any(|r| r.state_id == parent_id);
+        assert!(!parent_exists, "Parent should not exist after deletion");
+        assert_eq!(
+            child_rev.parent,
+            Some(parent_id),
+            "Child still references deleted parent (orphan)"
+        );
+        
+        // Document: Current behavior allows orphans (future PR should add validation)
+    }
+
+    // ========================================
+    // GATE 9: NEGATIVE TESTS - ERROR PATHS
+    // ========================================
+
+    #[test]
+    fn test_invalid_authority_format_rejected() {
+        // AUDIT GATE 9: Authority must be non-empty
+        let result = AuthorityId::new("");
+        assert!(result.is_err(), "Empty authority must be rejected");
+        
+        let result2 = AuthorityId::new("  ");
+        assert!(
+            result2.is_ok(),
+            "Whitespace authority currently allowed (future: validate)"
+        );
+    }
+
+    #[test]
+    fn test_invalid_state_id_hex_format_rejected() {
+        // AUDIT GATE 9: Invalid hex strings rejected
+        let result = StateId::from_hex("not_hex_at_all");
+        assert!(result.is_err(), "Invalid hex must be rejected");
+        
+        let result2 = StateId::from_hex("00");
+        assert!(result2.is_err(), "Too short hex must be rejected");
+        
+        let result3 = StateId::from_hex(
+            "00000000000000000000000000000000000000000000000000000000000000ZZZZZZZZZZ"
+        );
+        assert!(result3.is_err(), "Invalid hex characters must be rejected");
+    }
+
+    #[test]
+    fn test_revision_with_nonexistent_parent_rejected_at_create() {
+        // AUDIT GATE 9: Missing parent must be rejected explicitly
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("alice_test").unwrap();
+        
+        let mut history = StateHistory::new(temp_dir.path(), authority).unwrap();
+        
+        let fake_parent = StateId::from_hex(
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        )
+        .unwrap();
+        
+        let state = json!({"test": "data"});
+        let result = history.create_revision(&state, Some(fake_parent));
+        
+        assert!(result.is_err(), "Missing parent must be rejected");
+        
+        match result {
+            Err(StateHistoryError::MissingParent) => {
+                // Correct
+            }
+            Err(e) => {
+                panic!("Expected MissingParent error, got: {:?}", e);
+            }
+            Ok(_) => {
+                panic!("Should reject missing parent");
+            }
+        }
+    }
+
+    // ======================================
+    // GATE 8: GIT INDEPENDENCE VERIFICATION
+    // ======================================
+
+    #[test]
+    fn test_state_history_no_git_import_verification() {
+        // AUDIT GATE 8: Verify no Git module dependencies
+        // This test is primarily documentation; actual verification
+        // is done via code inspection (no git::* imports in state_history.rs)
+        
+        // Verify that StateHistory can be created without any Git infrastructure
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("git_test").unwrap();
+        
+        // This should succeed even if Git libs are not available
+        let result = StateHistory::new(temp_dir.path(), authority);
+        
+        assert!(
+            result.is_ok(),
+            "StateHistory must work independently of Git infrastructure"
+        );
     }
 }
