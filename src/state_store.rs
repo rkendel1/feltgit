@@ -182,6 +182,31 @@ impl StateStore {
         Ok(self.revision_to_handle(revision)?)
     }
 
+    /// Create a branch from an arbitrary parent without changing the current pointer.
+    /// Returns error if parent does not exist.
+    /// This is the explicit branching primitive: creates a new revision from any
+    /// existing state without modifying the current-state pointer, allowing
+    /// independent divergent histories to coexist.
+    pub fn create_branch(
+        &mut self,
+        parent: StateId,
+        next_state: &Value,
+    ) -> Result<StateHandle, StateStoreError> {
+        // Validate parent exists
+        if !self.exists(parent)? {
+            return Err(StateStoreError::ParentMismatch);
+        }
+
+        // Validate state can be canonicalized
+        let _canonical = CanonicalState::from_json(next_state)?;
+
+        // Create the revision with explicit parent
+        let revision = self.history.create_revision(next_state, Some(parent))?;
+
+        // NOTE: Do NOT update current pointer - this is the key distinction from commit()
+        Ok(self.revision_to_handle(revision)?)
+    }
+
     /// Get the current state.
     pub fn current(&self) -> Result<StateHandle, StateStoreError> {
         let state_id = self.current_state_id.ok_or(StateStoreError::PersistenceError(
@@ -1391,4 +1416,263 @@ mod tests {
             "GATE12: Current's parent must be legitimate ancestor"
         );
     }
+
+    #[test]
+    fn test_create_branch_basic() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("test_create_branch").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Create root state
+        let root = store.create(&json!({"root": true})).unwrap();
+        let root_id = root.state_id;
+
+        // Create a branch from root without changing current
+        let branch = store.create_branch(root_id, &json!({"branch": 1})).unwrap();
+
+        // Verify branch has correct parent
+        assert_eq!(branch.parent, Some(root_id), "Branch must have root as parent");
+
+        // Verify branch has correct state
+        assert_eq!(branch.state, json!({"branch": 1}), "Branch state must match");
+
+        // Verify current pointer hasn't changed
+        let current = store.current().unwrap();
+        assert_eq!(current.state_id, root_id, "Current must still point to root");
+    }
+
+    #[test]
+    fn test_create_branch_multiple_from_same_parent() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("test_multi_branch").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Create root state
+        let root = store.create(&json!({"root": true})).unwrap();
+        let root_id = root.state_id;
+
+        // Create multiple branches from root
+        let branch1 = store
+            .create_branch(root_id, &json!({"branch": "a"}))
+            .unwrap();
+        let branch2 = store
+            .create_branch(root_id, &json!({"branch": "b"}))
+            .unwrap();
+        let branch3 = store
+            .create_branch(root_id, &json!({"branch": "c"}))
+            .unwrap();
+
+        // All branches should have root as parent
+        assert_eq!(branch1.parent, Some(root_id));
+        assert_eq!(branch2.parent, Some(root_id));
+        assert_eq!(branch3.parent, Some(root_id));
+
+        // All branches should have different state_ids
+        assert_ne!(branch1.state_id, branch2.state_id);
+        assert_ne!(branch2.state_id, branch3.state_id);
+        assert_ne!(branch1.state_id, branch3.state_id);
+
+        // Current pointer should still point to root
+        let current = store.current().unwrap();
+        assert_eq!(current.state_id, root_id);
+    }
+
+    #[test]
+    fn test_create_branch_preserves_current_pointer() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("test_preserve_current").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Create root and move current forward
+        let root = store.create(&json!({"state": 0})).unwrap();
+        let root_id = root.state_id;
+
+        let state1 = store
+            .commit(&json!({"state": 1}), root_id)
+            .unwrap();
+        let state1_id = state1.state_id;
+
+        // Verify current is at state1
+        assert_eq!(store.current().unwrap().state_id, state1_id);
+
+        // Create a branch from root - should not change current
+        let branch = store
+            .create_branch(root_id, &json!({"state": "branch"}))
+            .unwrap();
+
+        // Current should still be at state1
+        let current_after = store.current().unwrap();
+        assert_eq!(current_after.state_id, state1_id, "Current must not change");
+
+        // But the branch should be retrievable
+        let retrieved = store.get(branch.state_id).unwrap();
+        assert_eq!(retrieved.state_id, branch.state_id);
+        assert_eq!(retrieved.parent, Some(root_id));
+    }
+
+    #[test]
+    fn test_create_branch_retrieval() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("test_branch_retrieval").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let root = store.create(&json!({"root": true})).unwrap();
+        let root_id = root.state_id;
+
+        let branch = store
+            .create_branch(root_id, &json!({"data": "branch_data"}))
+            .unwrap();
+        let branch_id = branch.state_id;
+
+        // Retrieve the branch by ID
+        let retrieved = store.get(branch_id).unwrap();
+
+        assert_eq!(retrieved.state_id, branch_id);
+        assert_eq!(retrieved.parent, Some(root_id));
+        assert_eq!(retrieved.state, json!({"data": "branch_data"}));
+    }
+
+    #[test]
+    fn test_create_branch_chain() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("test_branch_chain").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let root = store.create(&json!({"root": true})).unwrap();
+        let root_id = root.state_id;
+
+        // Create branch from root
+        let branch1 = store
+            .create_branch(root_id, &json!({"level": 1}))
+            .unwrap();
+        let branch1_id = branch1.state_id;
+
+        // Create another branch from branch1 (branching off a branch)
+        let branch2 = store
+            .create_branch(branch1_id, &json!({"level": 2}))
+            .unwrap();
+        let _branch2_id = branch2.state_id;
+
+        // Verify the chain
+        assert_eq!(branch1.parent, Some(root_id));
+        assert_eq!(branch2.parent, Some(branch1_id));
+
+        // Verify current is still at root
+        assert_eq!(store.current().unwrap().state_id, root_id);
+    }
+
+    #[test]
+    fn test_create_branch_invalid_parent() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("test_invalid_parent").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let _root = store.create(&json!({"root": true})).unwrap();
+
+        // Try to create branch from non-existent parent
+        let fake_parent = StateId::from_hex("0000000000000000000000000000000000000000000000000000000000000000").unwrap();
+        let result = store.create_branch(fake_parent, &json!({"data": "test"}));
+
+        assert!(result.is_err(), "Branch creation with invalid parent must fail");
+        match result {
+            Err(StateStoreError::ParentMismatch) => {
+                // Expected error
+            }
+            _ => panic!("Expected ParentMismatch error"),
+        }
+    }
+
+    #[test]
+    fn test_create_branch_vs_commit_difference() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("test_branch_vs_commit").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let root = store.create(&json!({"state": "root"})).unwrap();
+        let root_id = root.state_id;
+
+        // Create a branch - should not change current
+        let branch = store
+            .create_branch(root_id, &json!({"state": "branch"}))
+            .unwrap();
+        let branch_id = branch.state_id;
+
+        // After create_branch, current should still be root
+        assert_eq!(store.current().unwrap().state_id, root_id);
+
+        // Create a commit - should change current
+        let commit = store
+            .commit(&json!({"state": "commit"}), root_id)
+            .unwrap();
+        let commit_id = commit.state_id;
+
+        // After commit, current should be commit
+        assert_eq!(store.current().unwrap().state_id, commit_id);
+
+        // Both branch and commit are retrievable
+        assert_eq!(store.get(branch_id).unwrap().state_id, branch_id);
+        assert_eq!(store.get(commit_id).unwrap().state_id, commit_id);
+    }
+
+    #[test]
+    fn test_create_branch_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("test_branch_metadata").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority.clone()).unwrap();
+
+        let root = store.create(&json!({"root": true})).unwrap();
+        let root_id = root.state_id;
+
+        let branch = store
+            .create_branch(root_id, &json!({"branch": true}))
+            .unwrap();
+        let branch_id = branch.state_id;
+
+        // Check metadata
+        let metadata = store.metadata(branch_id).unwrap();
+        assert_eq!(metadata.state_id, branch_id);
+        assert_eq!(metadata.parent, Some(root_id));
+        assert_eq!(metadata.authority, authority);
+    }
+
+    #[test]
+    fn test_create_branch_persists_and_recovers() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("test_branch_persist").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority.clone()).unwrap();
+
+        let root = store.create(&json!({"root": true})).unwrap();
+        let root_id = root.state_id;
+
+        let branch = store
+            .create_branch(root_id, &json!({"branch": "persistent"}))
+            .unwrap();
+        let branch_id = branch.state_id;
+
+        // Drop the store
+        drop(store);
+
+        // Create a new store from the same directory
+        let store2 = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Verify branch still exists and can be retrieved
+        let retrieved = store2.get(branch_id).unwrap();
+        assert_eq!(retrieved.state_id, branch_id);
+        assert_eq!(retrieved.state, json!({"branch": "persistent"}));
+        assert_eq!(retrieved.parent, Some(root_id));
+
+        // Verify current pointer is still at root
+        let current = store2.current().unwrap();
+        assert_eq!(current.state_id, root_id);
+    }
+
 }
