@@ -3202,6 +3202,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_diff_json_numbers() {
+        // Verify: Different JSON number representations are treated as distinct
+        // This ensures PR #11 respects the PR #6 representation-sensitive canonicalization contract
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_json_numbers").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Test 1: 1 vs 1.0
+        let left_1 = store.create(&json!({"value": 1})).unwrap();
+        let right_1_0 = store.commit(&json!({"value": 1.0}), left_1.state_id).unwrap();
+
+        let diff = store.diff(left_1.state_id, right_1_0.state_id).unwrap();
+        // If serde_json preserves distinction, diff should report changed
+        // Note: serde_json may normalize these, so this test documents behavior
+        if json!(1) != json!(1.0) {
+            assert_eq!(diff.len(), 1, "1 and 1.0 must be reported as different if JSON preserves distinction");
+            match &diff.changes[0] {
+                StateChange::Changed { path, .. } => {
+                    assert_eq!(path.to_canonical_string(), "value");
+                }
+                _ => panic!("Expected Changed for 1 vs 1.0"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_diff_authority_neutrality() {
+        // Verify: diff() result is independent of the store's authority
+        // When comparing two states, the authority of the store instance does not affect the diff result
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create two states using authority "alice"
+        let authority_alice = AuthorityId::new("authority_alice").unwrap();
+        let mut store_alice = StateStore::new(temp_dir.path(), authority_alice).unwrap();
+        let state_a = json!({"value": 1});
+        let state_b = json!({"value": 2});
+        
+        let rev_a = store_alice.create(&state_a).unwrap();
+        let rev_b = store_alice.commit(&state_b, rev_a.state_id).unwrap();
+
+        // Compute diff with alice's store
+        let diff_alice = store_alice.diff(rev_a.state_id, rev_b.state_id).unwrap();
+
+        // Now create a new store with authority "bob" and load the same states
+        let authority_bob = AuthorityId::new("authority_bob").unwrap();
+        let store_bob = StateStore::new(temp_dir.path(), authority_bob).unwrap();
+        
+        // Compute diff with bob's store (different authority)
+        let diff_bob = store_bob.diff(rev_a.state_id, rev_b.state_id).unwrap();
+
+        // The diffs must be identical despite different authorities
+        assert_eq!(diff_alice.len(), diff_bob.len(), "Diff count must be independent of authority");
+        assert_eq!(diff_alice.changes.len(), 1, "Expected 1 change");
+        
+        // Verify the exact change is identical
+        match (&diff_alice.changes[0], &diff_bob.changes[0]) {
+            (
+                StateChange::Changed { path: p1, from: f1, to: t1 },
+                StateChange::Changed { path: p2, from: f2, to: t2 },
+            ) => {
+                assert_eq!(p1, p2, "Paths must match");
+                assert_eq!(f1, f2, "From values must match");
+                assert_eq!(t1, t2, "To values must match");
+            }
+            _ => panic!("Expected Changed changes in both diffs"),
+        }
+    }
+
     // ============================================================
     // EVIDENCE-FIRST HOSTILE AUDIT TESTS
     // ============================================================
