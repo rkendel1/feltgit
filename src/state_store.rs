@@ -4253,6 +4253,69 @@ mod tests {
         assert!(!classification.has_conflicts());
     }
 
+    #[test]
+    fn classify_divergent_mixed_convergent_and_conflict() {
+        // REQUIREMENT D2: Multiple paths with mixed convergent+conflict behavior
+        // EVIDENCE: Some paths converge while others conflict in same divergent state
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_mixed").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Base state with two paths
+        let base = store.create(&json!({"x": 1, "y": 1})).unwrap();
+        // Left: changes both x and y to 2
+        let left = store.commit(&json!({"x": 2, "y": 2}), base.state_id).unwrap();
+        // Right: changes x to 2 (converges) but y to 3 (conflicts)
+        let right = store.commit(&json!({"x": 2, "y": 3}), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        assert_eq!(classification.relationship, StateRelationship::Diverged);
+        
+        // Check that we have exactly 2 path conflicts (one convergent, one conflict)
+        assert_eq!(classification.path_conflicts.len(), 2, "Should have 2 path conflicts");
+        
+        // Get the individual conflicts
+        let x_path_conflict = classification.path_conflicts.iter()
+            .find(|c| c.path.to_canonical_string() == "x")
+            .expect("Should have conflict entry for x path");
+        let y_path_conflict = classification.path_conflicts.iter()
+            .find(|c| c.path.to_canonical_string() == "y")
+            .expect("Should have conflict entry for y path");
+        
+        // x should be Convergent (both sides reached 2)
+        assert_eq!(x_path_conflict.conflict_type, ConflictType::Convergent, "x should be convergent");
+        
+        // y should be Conflict (left→2, right→3)
+        assert_eq!(y_path_conflict.conflict_type, ConflictType::Conflict, "y should be conflicting");
+        
+        // Verify accessor methods correctly separate convergent from true conflicts
+        let convergent = classification.convergent_changes();
+        assert_eq!(convergent.len(), 1, "Should have 1 convergent change");
+        assert_eq!(convergent[0].path.to_canonical_string(), "x", "Convergent change should be on x");
+        
+        let true_conflicts = classification.true_conflicts();
+        assert_eq!(true_conflicts.len(), 1, "Should have 1 true conflict");
+        assert_eq!(true_conflicts[0].path.to_canonical_string(), "y", "True conflict should be on y");
+        
+        // Overall: has_conflicts() must return true (because of y)
+        assert!(classification.has_conflicts(), "Classification should report having conflicts");
+        
+        // Repeated classification must be deterministic
+        let classification2 = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+        assert_eq!(classification2.path_conflicts.len(), classification.path_conflicts.len());
+        assert_eq!(
+            classification2.true_conflicts().len(),
+            classification.true_conflicts().len(),
+            "Repeated classification should produce identical true_conflicts count"
+        );
+        assert_eq!(
+            classification2.convergent_changes().len(),
+            classification.convergent_changes().len(),
+            "Repeated classification should produce identical convergent_changes count"
+        );
+    }
 
     #[test]
     fn classify_delete_vs_modify() {
@@ -4421,23 +4484,70 @@ mod tests {
 
     #[test]
     fn classify_unrelated_states_no_base() {
-        // REQUIREMENT: Unrelated states have no common ancestor, base_state is None
-        // EVIDENCE: Two independently created states classify as Unrelated with no base
+        // CONTRACT: Unrelated states have no common ancestor
+        // EXPLICIT ARCHITECTURAL DECISION: Unrelated states are classified using two-way comparison against empty (null) base
+        // base_state = None
+        // left_changes = diff_from_empty(left_state)
+        // right_changes = diff_from_empty(right_state)
+        // This is NOT an error - it's a valid classification mode.
+        
         let temp_dir = TempDir::new().unwrap();
-        let authority1 = AuthorityId::new("classify_unrelated1").unwrap();
-        let authority2 = AuthorityId::new("classify_unrelated2").unwrap();
-
-        let mut store1 = StateStore::new(temp_dir.path().join("store1"), authority1).unwrap();
-        let mut store2 = StateStore::new(temp_dir.path().join("store2"), authority2).unwrap();
-
-        let state1 = store1.create(&json!({"data": "A"})).unwrap();
-        let state2 = store2.create(&json!({"data": "B"})).unwrap();
-
-        // Load both states into store1 (via manual history manipulation would be needed)
-        // For now, we test that the relationship detection works correctly
-        // This test would need special setup, so we skip the actual unrelated test
-        // and instead verify the logic is correct through diverged states
+        let authority = AuthorityId::new("classify_unrelated").unwrap();
+        
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+        
+        // Create state A in the store
+        let state_a_value = json!({"a": 1});
+        let state_a = store.create(&state_a_value).unwrap();
+        
+        // Create an independent state that shares NO ancestry with state_a
+        let state_b_value = json!({"x": 10});
+        let state_b = store.create(&state_b_value).unwrap();
+        
+        // Both states were created from null, so they're unrelated
+        let classification = store.classify_conflicts(state_a.state_id, state_b.state_id).unwrap();
+        
+        // PROVEN CONTRACT:
+        assert_eq!(classification.relationship, StateRelationship::Unrelated,
+            "Independent root states should be classified as Unrelated");
+        
+        // base_state must be None (not an error, but explicitly None)
+        assert_eq!(classification.base_state, None,
+            "Unrelated states must have base_state = None (no common ancestor)");
+        
+        // left_changes should be the diff from empty/null to state_a
+        assert!(!classification.left_changes.is_empty(),
+            "Unrelated left state should have changes from empty base");
+        
+        // right_changes should be the diff from empty/null to state_b
+        assert!(!classification.right_changes.is_empty(),
+            "Unrelated right state should have changes from empty base");
+        
+        // When both sides change the root to completely different objects, 
+        // it is a CONFLICT (root path conflict)
+        let conflicts = classification.true_conflicts();
+        assert!(!conflicts.is_empty(),
+            "Unrelated states with different root objects should have root-level conflict");
+        
+        // The conflict is at the root path
+        let root_conflict = conflicts.iter()
+            .find(|c| c.path.to_canonical_string() == "");
+        assert!(root_conflict.is_some(), 
+            "Should have conflict at root path when objects are entirely different");
+        
+        // Verify the classification is deterministic
+        let classification2 = store.classify_conflicts(state_a.state_id, state_b.state_id).unwrap();
+        assert_eq!(classification2.relationship, StateRelationship::Unrelated);
+        assert_eq!(classification2.base_state, None);
+        assert_eq!(classification.left_changes.len(), classification2.left_changes.len());
+        assert_eq!(classification.right_changes.len(), classification2.right_changes.len());
+        assert_eq!(classification.path_conflicts.len(), classification2.path_conflicts.len(),
+            "Classification of same unrelated states must be deterministic");
     }
+
+
+
+
 
     #[test]
     fn classify_authority_neutrality() {
