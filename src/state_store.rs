@@ -30,6 +30,7 @@ pub enum StateStoreError {
     DeserializationError(String),
     IoError(String),
     PersistenceError(String),
+    ConflictClassificationError(String),
 }
 
 impl Display for StateStoreError {
@@ -43,6 +44,7 @@ impl Display for StateStoreError {
             StateStoreError::DeserializationError(e) => write!(f, "deserialization error: {}", e),
             StateStoreError::IoError(e) => write!(f, "io error: {}", e),
             StateStoreError::PersistenceError(e) => write!(f, "persistence error: {}", e),
+            StateStoreError::ConflictClassificationError(e) => write!(f, "conflict classification error: {}", e),
         }
     }
 }
@@ -238,6 +240,160 @@ impl StateDiff {
     /// Get the number of changes.
     pub fn len(&self) -> usize {
         self.changes.len()
+    }
+}
+
+/// Describes the nature of semantic differences at a specific path.
+/// Used to classify whether changes conflict or can coexist.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ConflictType {
+    /// Changes occur at different semantic paths.
+    /// These are always independently compatible.
+    Independent,
+    
+    /// Both sides changed the same path to identical values.
+    /// These are convergent (both agree on the final state).
+    Convergent,
+    
+    /// Same path changed on both sides to different values.
+    /// This is a true conflict that requires external resolution.
+    Conflict,
+}
+
+impl Display for ConflictType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConflictType::Independent => write!(f, "Independent"),
+            ConflictType::Convergent => write!(f, "Convergent"),
+            ConflictType::Conflict => write!(f, "Conflict"),
+        }
+    }
+}
+
+/// Describes a conflict at a specific semantic path.
+/// Contains the changes from each side and their classification.
+#[derive(Debug, Clone)]
+pub struct PathConflict {
+    /// The path where the conflict occurs.
+    pub path: StatePath,
+    
+    /// The change on the left side (from base to left).
+    pub left_change: StateChange,
+    
+    /// The change on the right side (from base to right).
+    pub right_change: StateChange,
+    
+    /// The classification of this conflict.
+    pub conflict_type: ConflictType,
+}
+
+impl PathConflict {
+    /// Get a canonical ordering key for deterministic sorting.
+    fn ordering_key(&self) -> &StatePath {
+        &self.path
+    }
+}
+
+impl Ord for PathConflict {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.ordering_key().cmp(other.ordering_key())
+    }
+}
+
+impl PartialOrd for PathConflict {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Eq for PathConflict {}
+
+impl PartialEq for PathConflict {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+/// Classification of semantic conflicts between two state revisions.
+/// 
+/// This is purely observational and descriptive:
+/// - Does NOT choose a winner
+/// - Does NOT merge states
+/// - Does NOT modify either state
+/// - Does NOT apply changes
+/// - Does NOT synchronize or replicate
+/// - Does NOT invoke Git
+/// 
+/// The classification identifies:
+/// - The topological relationship between the states
+/// - Which changes are independent and therefore compatible
+/// - Which changes converge to the same value
+/// - Which changes create true conflicts requiring resolution
+#[derive(Debug, Clone)]
+pub struct ConflictClassification {
+    /// The causal relationship between left and right states.
+    /// Determines whether a common ancestor exists and how to interpret changes.
+    pub relationship: StateRelationship,
+    
+    /// The common ancestor state (if divergent) or None if unrelated.
+    /// When relationship is Identity, this is the same as both left and right.
+    /// When relationship is Ancestor/Descendant, this is the ancestor.
+    /// When relationship is Diverged, this is the most recent common ancestor.
+    /// When relationship is Unrelated, this is None.
+    pub base_state: Option<StateId>,
+    
+    /// All changes from base to left (in divergent case) or ancestor to left (ancestry case).
+    /// Empty if left == right (Identity).
+    /// Sorted deterministically by path.
+    pub left_changes: Vec<StateChange>,
+    
+    /// All changes from base to right (in divergent case) or ancestor to right (ancestry case).
+    /// Empty if left == right (Identity).
+    /// Sorted deterministically by path.
+    pub right_changes: Vec<StateChange>,
+    
+    /// Classified conflicts at specific paths.
+    /// Empty if there are no conflicting changes.
+    /// Sorted deterministically by path.
+    /// Includes both true conflicts and convergent changes for complete visibility.
+    pub path_conflicts: Vec<PathConflict>,
+}
+
+impl ConflictClassification {
+    /// Check if any true conflicts (non-convergent) exist.
+    pub fn has_conflicts(&self) -> bool {
+        self.path_conflicts
+            .iter()
+            .any(|pc| pc.conflict_type == ConflictType::Conflict)
+    }
+
+    /// Get only the true conflicts (not convergent changes).
+    pub fn true_conflicts(&self) -> Vec<&PathConflict> {
+        self.path_conflicts
+            .iter()
+            .filter(|pc| pc.conflict_type == ConflictType::Conflict)
+            .collect()
+    }
+
+    /// Get only the convergent changes.
+    pub fn convergent_changes(&self) -> Vec<&PathConflict> {
+        self.path_conflicts
+            .iter()
+            .filter(|pc| pc.conflict_type == ConflictType::Convergent)
+            .collect()
+    }
+
+    /// Check if the classification represents identity (same state on both sides).
+    pub fn is_identity(&self) -> bool {
+        self.relationship == StateRelationship::Identity
+    }
+
+    /// Check if one side is an ancestor of the other (no divergence).
+    pub fn is_linear_history(&self) -> bool {
+        matches!(
+            self.relationship,
+            StateRelationship::Identity | StateRelationship::Ancestor | StateRelationship::Descendant
+        )
     }
 }
 
@@ -458,6 +614,217 @@ impl StateStore {
         let changes = Self::compute_diff(&left_handle.state, &right_handle.state, StatePath::root());
 
         Ok(StateDiff::new(changes))
+    }
+
+    /// Classify semantic conflicts between two divergent application states.
+    /// 
+    /// This is a purely observational primitive that identifies:
+    /// - Whether states are related (identity, ancestry, divergent, unrelated)
+    /// - Which changes are independent and therefore compatible
+    /// - Which changes converge to the same value
+    /// - Which changes create conflicts requiring external resolution
+    /// 
+    /// This primitive does NOT:
+    /// - Choose a winner or prefer one state
+    /// - Merge or modify either state
+    /// - Update the current pointer
+    /// - Invoke Git or write durable state
+    /// - Select a resolution
+    /// - Depend on authority
+    /// 
+    /// For three-way comparison:
+    /// - If states are identical, uses either as base
+    /// - If one is ancestor of other, uses ancestor as base
+    /// - If states diverged, automatically finds common ancestor
+    /// - If unrelated, returns classification with no base
+    /// 
+    /// Returns an error if either state does not exist or is corrupted.
+    pub fn classify_conflicts(
+        &self,
+        left: StateId,
+        right: StateId,
+    ) -> Result<ConflictClassification, StateStoreError> {
+        // Determine relationship
+        let relationship = self.relationship(left, right)?;
+
+        // Load both states (will error if either doesn't exist)
+        let left_handle = self.get(left)?;
+        let right_handle = self.get(right)?;
+
+        // Determine base state and get diffs
+        let (base_state, left_changes, right_changes) = match relationship {
+            StateRelationship::Identity => {
+                // Same state - no changes on either side
+                (Some(left), Vec::new(), Vec::new())
+            }
+            StateRelationship::Ancestor => {
+                // Left is ancestor of right - right has all changes, left has none
+                let right_diff = self.diff(left, right)?;
+                (Some(left), Vec::new(), right_diff.changes)
+            }
+            StateRelationship::Descendant => {
+                // Right is ancestor of left - left has all changes, right has none
+                let left_diff = self.diff(right, left)?;
+                (Some(right), left_diff.changes, Vec::new())
+            }
+            StateRelationship::Diverged => {
+                // Both diverged from common ancestor - need three-way comparison
+                if let Some(base_id) = self.common_ancestor(left, right) {
+                    let _base_handle = self.get(base_id)?;
+                    let left_diff = self.diff(base_id, left)?;
+                    let right_diff = self.diff(base_id, right)?;
+                    (Some(base_id), left_diff.changes, right_diff.changes)
+                } else {
+                    // Shouldn't happen if relationship is Diverged
+                    return Err(StateStoreError::ConflictClassificationError(
+                        "diverged states have no common ancestor".to_string(),
+                    ));
+                }
+            }
+            StateRelationship::Unrelated => {
+                // No common ancestor - treat as independent changes from empty base
+                let left_diff = StateStore::diff_from_empty(&left_handle.state);
+                let right_diff = StateStore::diff_from_empty(&right_handle.state);
+                (None, left_diff, right_diff)
+            }
+        };
+
+        // Classify conflicts
+        let path_conflicts = Self::compute_path_conflicts(&left_changes, &right_changes);
+
+        Ok(ConflictClassification {
+            relationship,
+            base_state,
+            left_changes,
+            right_changes,
+            path_conflicts,
+        })
+    }
+
+    /// Compute the diff between a value and the empty state (null).
+    /// Used for unrelated states.
+    fn diff_from_empty(value: &Value) -> Vec<StateChange> {
+        // Treating empty as null, compute diff from null to value
+        Self::compute_diff(&Value::Null, value, StatePath::root())
+    }
+
+    /// Compute path-level conflicts from two sets of changes.
+    /// 
+    /// For each changed path:
+    /// - If only left changed: always compatible (independent)
+    /// - If only right changed: always compatible (independent)
+    /// - If both changed to same value: convergent (compatible by definition)
+    /// - If both changed differently: conflict (requires resolution)
+    fn compute_path_conflicts(left_changes: &[StateChange], right_changes: &[StateChange]) -> Vec<PathConflict> {
+        use std::collections::BTreeMap;
+
+        let mut conflicts = Vec::new();
+
+        // Index changes by path for O(1) lookup
+        let mut left_by_path: BTreeMap<StatePath, &StateChange> = BTreeMap::new();
+        let mut right_by_path: BTreeMap<StatePath, &StateChange> = BTreeMap::new();
+
+        for change in left_changes {
+            left_by_path.insert(change.path().clone(), change);
+        }
+
+        for change in right_changes {
+            right_by_path.insert(change.path().clone(), change);
+        }
+
+        // Collect all touched paths
+        let mut all_paths: std::collections::BTreeSet<StatePath> = std::collections::BTreeSet::new();
+        for change in left_changes {
+            all_paths.insert(change.path().clone());
+        }
+        for change in right_changes {
+            all_paths.insert(change.path().clone());
+        }
+
+        // Classify each path
+        for path in all_paths {
+            match (left_by_path.get(&path), right_by_path.get(&path)) {
+                (Some(left_change), Some(right_change)) => {
+                    // Both sides changed the same path
+                    let conflict_type = if Self::changes_are_equivalent(left_change, right_change) {
+                        ConflictType::Convergent
+                    } else {
+                        ConflictType::Conflict
+                    };
+
+                    conflicts.push(PathConflict {
+                        path,
+                        left_change: (*left_change).clone(),
+                        right_change: (*right_change).clone(),
+                        conflict_type,
+                    });
+                }
+                (Some(_left_change), None) => {
+                    // Only left changed - this is independent, but we don't record it
+                    // as a path conflict since there's no conflict here
+                }
+                (None, Some(_right_change)) => {
+                    // Only right changed - this is independent, but we don't record it
+                    // as a path conflict since there's no conflict here
+                }
+                (None, None) => {
+                    // Shouldn't happen since we built paths from actual changes
+                }
+            }
+        }
+
+        // Ensure deterministic ordering
+        conflicts.sort();
+        conflicts
+    }
+
+    /// Check if two changes are equivalent (target the same final value).
+    /// 
+    /// Two changes are equivalent if they result in the same value at the path.
+    /// This includes:
+    /// - Both add the same value
+    /// - Both remove and both target the same removal
+    /// - Both change to the same final value
+    fn changes_are_equivalent(left: &StateChange, right: &StateChange) -> bool {
+        match (left, right) {
+            (
+                StateChange::Added {
+                    path: left_path,
+                    value: left_value,
+                },
+                StateChange::Added {
+                    path: right_path,
+                    value: right_value,
+                },
+            ) => left_path == right_path && left_value == right_value,
+
+            (
+                StateChange::Removed {
+                    path: left_path,
+                    value: left_value,
+                },
+                StateChange::Removed {
+                    path: right_path,
+                    value: right_value,
+                },
+            ) => left_path == right_path && left_value == right_value,
+
+            (
+                StateChange::Changed {
+                    path: left_path,
+                    to: left_to,
+                    ..
+                },
+                StateChange::Changed {
+                    path: right_path,
+                    to: right_to,
+                    ..
+                },
+            ) => left_path == right_path && left_to == right_to,
+
+            // Different change types at same path = not equivalent
+            _ => false,
+        }
     }
 
     /// Compute semantic diff between two JSON values.
