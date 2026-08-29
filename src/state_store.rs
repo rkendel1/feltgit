@@ -112,6 +112,10 @@ pub struct ReconciliationPlan {
     /// The explicit candidate result supplied by the caller.
     /// FeltDB does not decide this value; it only validates and materializes it.
     pub result: Value,
+    /// The caller's choice of which causal input becomes the parent in the resulting state.
+    /// Must be one of: left_state, right_state, or base_state (if present).
+    /// This allows the caller to select the linearity orientation without FeltDB deciding policy.
+    pub parent_choice: StateId,
 }
 
 /// A segment of a path to a location in application state.
@@ -1064,6 +1068,7 @@ impl StateStore {
     /// - base state (if provided) is a valid common ancestor of left and right
     /// - the relationship matches the reconciliation context
     /// - the candidate result can be canonicalized
+    /// - parent_choice is one of the causal inputs
     ///
     /// On success, creates a new immutable state from the caller-supplied result and returns
     /// a StateHandle representing it. The new state is NOT automatically added to current;
@@ -1071,6 +1076,7 @@ impl StateStore {
     ///
     /// FeltDB does NOT decide the result. The caller supplies the exact candidate value.
     /// FeltDB only validates that the causal context is consistent.
+    /// FeltDB does NOT decide the parent. The caller chooses which causal input becomes the parent.
     pub fn reconcile(&mut self, plan: &ReconciliationPlan) -> Result<StateHandle, StateStoreError> {
         // Validate left state exists
         if !self.exists(plan.left_state)? {
@@ -1080,6 +1086,17 @@ impl StateStore {
         // Validate right state exists
         if !self.exists(plan.right_state)? {
             return Err(StateStoreError::MissingRightState);
+        }
+
+        // Validate parent_choice is one of the causal inputs
+        let is_valid_parent = plan.parent_choice == plan.left_state 
+            || plan.parent_choice == plan.right_state
+            || (plan.base_state.is_some() && plan.parent_choice == plan.base_state.unwrap());
+        
+        if !is_valid_parent {
+            return Err(StateStoreError::ReconciliationError(
+                "parent_choice must be one of: left_state, right_state, or base_state".to_string(),
+            ));
         }
 
         // Determine relationship between left and right
@@ -1127,17 +1144,12 @@ impl StateStore {
         let _canonical = CanonicalState::from_json(&plan.result)?;
 
         // Create a new revision from the candidate result.
-        // The parent of a reconciled state must be explicit.
-        // For now, we use create_branch (no current pointer update) to preserve
-        // the immutability of the base/left/right states.
-        // The caller must explicitly commit or branch from this new state.
-        //
-        // The parent of a reconciled state is left by default (arbitrary choice).
-        // The important provenance (base, left, right) is stored in the state itself
-        // if the caller needs to track it.
+        // The parent is determined by the caller's explicit choice.
+        // This preserves policy neutrality: FeltDB does not decide which input becomes the parent.
+        // The caller's choice determines the linearity orientation of the reconciled state.
         let revision = self
             .history
-            .create_revision(&plan.result, Some(plan.left_state))?;
+            .create_revision(&plan.result, Some(plan.parent_choice))?;
 
         Ok(self.revision_to_handle(revision)?)
     }
@@ -4882,6 +4894,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: result.clone(),
+            parent_choice: left.state_id,
         };
 
         let reconciled = store.reconcile(&plan).unwrap();
@@ -4915,6 +4928,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: result.clone(),
+            parent_choice: right.state_id,
         };
 
         let reconciled = store.reconcile(&plan).unwrap();
@@ -4944,6 +4958,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: result.clone(),
+        parent_choice: left.state_id,
         };
 
         let reconciled = store.reconcile(&plan).unwrap();
@@ -4970,6 +4985,7 @@ mod tests {
             left_state: state.state_id,
             right_state: state.state_id,
             result: json!({"x": 1, "identity_reconciled": true}),
+            parent_choice: state.state_id,
         };
 
         let reconciled = store.reconcile(&plan).unwrap();
@@ -4996,6 +5012,7 @@ mod tests {
             left_state: ancestor.state_id,
             right_state: descendant.state_id,
             result: result.clone(),
+            parent_choice: ancestor.state_id,
         };
 
         let reconciled = store.reconcile(&plan).unwrap();
@@ -5020,6 +5037,7 @@ mod tests {
             left_state: fake_id,
             right_state: right.state_id,
             result: json!({"x": 1}),
+            parent_choice: fake_id,
         };
 
         let result = store.reconcile(&plan);
@@ -5047,6 +5065,7 @@ mod tests {
             left_state: left.state_id,
             right_state: fake_id,
             result: json!({"x": 1}),
+        parent_choice: left.state_id,
         };
 
         let result = store.reconcile(&plan);
@@ -5078,6 +5097,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: json!({"x": 2}),
+        parent_choice: left.state_id,
         };
 
         let result = store.reconcile(&plan);
@@ -5135,6 +5155,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: json!({"x": 2, "immutability_test": true}),
+        parent_choice: left.state_id,
         };
 
         let _reconciled = store.reconcile(&plan).unwrap();
@@ -5165,6 +5186,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: json!({"x": 99}),
+        parent_choice: left.state_id,
         };
 
         let _reconciled = store.reconcile(&plan).unwrap();
@@ -5195,6 +5217,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: json!({"x": 99}),
+        parent_choice: left.state_id,
         };
 
         let _reconciled = store.reconcile(&plan).unwrap();
@@ -5226,6 +5249,7 @@ mod tests {
             left_state: _left.state_id,
             right_state: _right.state_id,
             result: json!({"x": 2, "current_pointer_test": true}),
+            parent_choice: _left.state_id,
         };
 
         let _reconciled = store.reconcile(&plan).unwrap();
@@ -5256,6 +5280,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: result_value.clone(),
+            parent_choice: left.state_id,
         };
 
         let reconciled1 = store.reconcile(&plan1).unwrap();
@@ -5274,6 +5299,7 @@ mod tests {
             left_state: left2.state_id,
             right_state: right2.state_id,
             result: result_value,
+            parent_choice: left2.state_id,
         };
 
         let reconciled2 = store2.reconcile(&plan2).unwrap();
@@ -5302,6 +5328,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: json!({"x": 2, "test": "authority_neutrality"}),
+        parent_choice: left.state_id,
         };
 
         let reconciled = store.reconcile(&plan).unwrap();
@@ -5333,6 +5360,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: json!({"data": "merged"}),
+        parent_choice: left.state_id,
         };
 
         let reconciled = store.reconcile(&plan).unwrap();
@@ -5389,6 +5417,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: json!({"x": 2, "merged": true}),
+        parent_choice: left.state_id,
         };
         let result = store.reconcile(&plan).unwrap();
 
@@ -5482,6 +5511,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: json!({"x": 2, "from": "reconciliation"}),
+        parent_choice: left.state_id,
         };
         let result = store.reconcile(&plan).unwrap();
 
@@ -5560,6 +5590,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: json!({"x": 2, "reconciled": true}),
+        parent_choice: left.state_id,
         };
         let result = store.reconcile(&plan).unwrap();
 
@@ -5626,6 +5657,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: json!({"x": 2, "parent_choice": "left"}),
+        parent_choice: left.state_id,
         };
         let result_left_parent = store.reconcile(&plan).unwrap();
 
@@ -5735,6 +5767,7 @@ mod tests {
             left_state: left.state_id,
             right_state: right.state_id,
             result: json!({"x": 2, "no_provenance": true}),
+        parent_choice: left.state_id,
         };
         let result = store.reconcile(&plan).unwrap();
 
