@@ -30,6 +30,7 @@ pub enum StateStoreError {
     DeserializationError(String),
     IoError(String),
     PersistenceError(String),
+    ConflictClassificationError(String),
 }
 
 impl Display for StateStoreError {
@@ -43,6 +44,7 @@ impl Display for StateStoreError {
             StateStoreError::DeserializationError(e) => write!(f, "deserialization error: {}", e),
             StateStoreError::IoError(e) => write!(f, "io error: {}", e),
             StateStoreError::PersistenceError(e) => write!(f, "persistence error: {}", e),
+            StateStoreError::ConflictClassificationError(e) => write!(f, "conflict classification error: {}", e),
         }
     }
 }
@@ -238,6 +240,160 @@ impl StateDiff {
     /// Get the number of changes.
     pub fn len(&self) -> usize {
         self.changes.len()
+    }
+}
+
+/// Describes the nature of semantic differences at a specific path.
+/// Used to classify whether changes conflict or can coexist.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ConflictType {
+    /// Changes occur at different semantic paths.
+    /// These are always independently compatible.
+    Independent,
+    
+    /// Both sides changed the same path to identical values.
+    /// These are convergent (both agree on the final state).
+    Convergent,
+    
+    /// Same path changed on both sides to different values.
+    /// This is a true conflict that requires external resolution.
+    Conflict,
+}
+
+impl Display for ConflictType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConflictType::Independent => write!(f, "Independent"),
+            ConflictType::Convergent => write!(f, "Convergent"),
+            ConflictType::Conflict => write!(f, "Conflict"),
+        }
+    }
+}
+
+/// Describes a conflict at a specific semantic path.
+/// Contains the changes from each side and their classification.
+#[derive(Debug, Clone)]
+pub struct PathConflict {
+    /// The path where the conflict occurs.
+    pub path: StatePath,
+    
+    /// The change on the left side (from base to left).
+    pub left_change: StateChange,
+    
+    /// The change on the right side (from base to right).
+    pub right_change: StateChange,
+    
+    /// The classification of this conflict.
+    pub conflict_type: ConflictType,
+}
+
+impl PathConflict {
+    /// Get a canonical ordering key for deterministic sorting.
+    fn ordering_key(&self) -> &StatePath {
+        &self.path
+    }
+}
+
+impl Ord for PathConflict {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.ordering_key().cmp(other.ordering_key())
+    }
+}
+
+impl PartialOrd for PathConflict {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Eq for PathConflict {}
+
+impl PartialEq for PathConflict {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+/// Classification of semantic conflicts between two state revisions.
+/// 
+/// This is purely observational and descriptive:
+/// - Does NOT choose a winner
+/// - Does NOT merge states
+/// - Does NOT modify either state
+/// - Does NOT apply changes
+/// - Does NOT synchronize or replicate
+/// - Does NOT invoke Git
+/// 
+/// The classification identifies:
+/// - The topological relationship between the states
+/// - Which changes are independent and therefore compatible
+/// - Which changes converge to the same value
+/// - Which changes create true conflicts requiring resolution
+#[derive(Debug, Clone)]
+pub struct ConflictClassification {
+    /// The causal relationship between left and right states.
+    /// Determines whether a common ancestor exists and how to interpret changes.
+    pub relationship: StateRelationship,
+    
+    /// The common ancestor state (if divergent) or None if unrelated.
+    /// When relationship is Identity, this is the same as both left and right.
+    /// When relationship is Ancestor/Descendant, this is the ancestor.
+    /// When relationship is Diverged, this is the most recent common ancestor.
+    /// When relationship is Unrelated, this is None.
+    pub base_state: Option<StateId>,
+    
+    /// All changes from base to left (in divergent case) or ancestor to left (ancestry case).
+    /// Empty if left == right (Identity).
+    /// Sorted deterministically by path.
+    pub left_changes: Vec<StateChange>,
+    
+    /// All changes from base to right (in divergent case) or ancestor to right (ancestry case).
+    /// Empty if left == right (Identity).
+    /// Sorted deterministically by path.
+    pub right_changes: Vec<StateChange>,
+    
+    /// Classified conflicts at specific paths.
+    /// Empty if there are no conflicting changes.
+    /// Sorted deterministically by path.
+    /// Includes both true conflicts and convergent changes for complete visibility.
+    pub path_conflicts: Vec<PathConflict>,
+}
+
+impl ConflictClassification {
+    /// Check if any true conflicts (non-convergent) exist.
+    pub fn has_conflicts(&self) -> bool {
+        self.path_conflicts
+            .iter()
+            .any(|pc| pc.conflict_type == ConflictType::Conflict)
+    }
+
+    /// Get only the true conflicts (not convergent changes).
+    pub fn true_conflicts(&self) -> Vec<&PathConflict> {
+        self.path_conflicts
+            .iter()
+            .filter(|pc| pc.conflict_type == ConflictType::Conflict)
+            .collect()
+    }
+
+    /// Get only the convergent changes.
+    pub fn convergent_changes(&self) -> Vec<&PathConflict> {
+        self.path_conflicts
+            .iter()
+            .filter(|pc| pc.conflict_type == ConflictType::Convergent)
+            .collect()
+    }
+
+    /// Check if the classification represents identity (same state on both sides).
+    pub fn is_identity(&self) -> bool {
+        self.relationship == StateRelationship::Identity
+    }
+
+    /// Check if one side is an ancestor of the other (no divergence).
+    pub fn is_linear_history(&self) -> bool {
+        matches!(
+            self.relationship,
+            StateRelationship::Identity | StateRelationship::Ancestor | StateRelationship::Descendant
+        )
     }
 }
 
@@ -458,6 +614,217 @@ impl StateStore {
         let changes = Self::compute_diff(&left_handle.state, &right_handle.state, StatePath::root());
 
         Ok(StateDiff::new(changes))
+    }
+
+    /// Classify semantic conflicts between two divergent application states.
+    /// 
+    /// This is a purely observational primitive that identifies:
+    /// - Whether states are related (identity, ancestry, divergent, unrelated)
+    /// - Which changes are independent and therefore compatible
+    /// - Which changes converge to the same value
+    /// - Which changes create conflicts requiring external resolution
+    /// 
+    /// This primitive does NOT:
+    /// - Choose a winner or prefer one state
+    /// - Merge or modify either state
+    /// - Update the current pointer
+    /// - Invoke Git or write durable state
+    /// - Select a resolution
+    /// - Depend on authority
+    /// 
+    /// For three-way comparison:
+    /// - If states are identical, uses either as base
+    /// - If one is ancestor of other, uses ancestor as base
+    /// - If states diverged, automatically finds common ancestor
+    /// - If unrelated, returns classification with no base
+    /// 
+    /// Returns an error if either state does not exist or is corrupted.
+    pub fn classify_conflicts(
+        &self,
+        left: StateId,
+        right: StateId,
+    ) -> Result<ConflictClassification, StateStoreError> {
+        // Determine relationship
+        let relationship = self.relationship(left, right)?;
+
+        // Load both states (will error if either doesn't exist)
+        let left_handle = self.get(left)?;
+        let right_handle = self.get(right)?;
+
+        // Determine base state and get diffs
+        let (base_state, left_changes, right_changes) = match relationship {
+            StateRelationship::Identity => {
+                // Same state - no changes on either side
+                (Some(left), Vec::new(), Vec::new())
+            }
+            StateRelationship::Ancestor => {
+                // Left is ancestor of right - right has all changes, left has none
+                let right_diff = self.diff(left, right)?;
+                (Some(left), Vec::new(), right_diff.changes)
+            }
+            StateRelationship::Descendant => {
+                // Right is ancestor of left - left has all changes, right has none
+                let left_diff = self.diff(right, left)?;
+                (Some(right), left_diff.changes, Vec::new())
+            }
+            StateRelationship::Diverged => {
+                // Both diverged from common ancestor - need three-way comparison
+                if let Some(base_id) = self.common_ancestor(left, right) {
+                    let _base_handle = self.get(base_id)?;
+                    let left_diff = self.diff(base_id, left)?;
+                    let right_diff = self.diff(base_id, right)?;
+                    (Some(base_id), left_diff.changes, right_diff.changes)
+                } else {
+                    // Shouldn't happen if relationship is Diverged
+                    return Err(StateStoreError::ConflictClassificationError(
+                        "diverged states have no common ancestor".to_string(),
+                    ));
+                }
+            }
+            StateRelationship::Unrelated => {
+                // No common ancestor - treat as independent changes from empty base
+                let left_diff = StateStore::diff_from_empty(&left_handle.state);
+                let right_diff = StateStore::diff_from_empty(&right_handle.state);
+                (None, left_diff, right_diff)
+            }
+        };
+
+        // Classify conflicts
+        let path_conflicts = Self::compute_path_conflicts(&left_changes, &right_changes);
+
+        Ok(ConflictClassification {
+            relationship,
+            base_state,
+            left_changes,
+            right_changes,
+            path_conflicts,
+        })
+    }
+
+    /// Compute the diff between a value and the empty state (null).
+    /// Used for unrelated states.
+    fn diff_from_empty(value: &Value) -> Vec<StateChange> {
+        // Treating empty as null, compute diff from null to value
+        Self::compute_diff(&Value::Null, value, StatePath::root())
+    }
+
+    /// Compute path-level conflicts from two sets of changes.
+    /// 
+    /// For each changed path:
+    /// - If only left changed: always compatible (independent)
+    /// - If only right changed: always compatible (independent)
+    /// - If both changed to same value: convergent (compatible by definition)
+    /// - If both changed differently: conflict (requires resolution)
+    fn compute_path_conflicts(left_changes: &[StateChange], right_changes: &[StateChange]) -> Vec<PathConflict> {
+        use std::collections::BTreeMap;
+
+        let mut conflicts = Vec::new();
+
+        // Index changes by path for O(1) lookup
+        let mut left_by_path: BTreeMap<StatePath, &StateChange> = BTreeMap::new();
+        let mut right_by_path: BTreeMap<StatePath, &StateChange> = BTreeMap::new();
+
+        for change in left_changes {
+            left_by_path.insert(change.path().clone(), change);
+        }
+
+        for change in right_changes {
+            right_by_path.insert(change.path().clone(), change);
+        }
+
+        // Collect all touched paths
+        let mut all_paths: std::collections::BTreeSet<StatePath> = std::collections::BTreeSet::new();
+        for change in left_changes {
+            all_paths.insert(change.path().clone());
+        }
+        for change in right_changes {
+            all_paths.insert(change.path().clone());
+        }
+
+        // Classify each path
+        for path in all_paths {
+            match (left_by_path.get(&path), right_by_path.get(&path)) {
+                (Some(left_change), Some(right_change)) => {
+                    // Both sides changed the same path
+                    let conflict_type = if Self::changes_are_equivalent(left_change, right_change) {
+                        ConflictType::Convergent
+                    } else {
+                        ConflictType::Conflict
+                    };
+
+                    conflicts.push(PathConflict {
+                        path,
+                        left_change: (*left_change).clone(),
+                        right_change: (*right_change).clone(),
+                        conflict_type,
+                    });
+                }
+                (Some(_left_change), None) => {
+                    // Only left changed - this is independent, but we don't record it
+                    // as a path conflict since there's no conflict here
+                }
+                (None, Some(_right_change)) => {
+                    // Only right changed - this is independent, but we don't record it
+                    // as a path conflict since there's no conflict here
+                }
+                (None, None) => {
+                    // Shouldn't happen since we built paths from actual changes
+                }
+            }
+        }
+
+        // Ensure deterministic ordering
+        conflicts.sort();
+        conflicts
+    }
+
+    /// Check if two changes are equivalent (target the same final value).
+    /// 
+    /// Two changes are equivalent if they result in the same value at the path.
+    /// This includes:
+    /// - Both add the same value
+    /// - Both remove and both target the same removal
+    /// - Both change to the same final value
+    fn changes_are_equivalent(left: &StateChange, right: &StateChange) -> bool {
+        match (left, right) {
+            (
+                StateChange::Added {
+                    path: left_path,
+                    value: left_value,
+                },
+                StateChange::Added {
+                    path: right_path,
+                    value: right_value,
+                },
+            ) => left_path == right_path && left_value == right_value,
+
+            (
+                StateChange::Removed {
+                    path: left_path,
+                    value: left_value,
+                },
+                StateChange::Removed {
+                    path: right_path,
+                    value: right_value,
+                },
+            ) => left_path == right_path && left_value == right_value,
+
+            (
+                StateChange::Changed {
+                    path: left_path,
+                    to: left_to,
+                    ..
+                },
+                StateChange::Changed {
+                    path: right_path,
+                    to: right_to,
+                    ..
+                },
+            ) => left_path == right_path && left_to == right_to,
+
+            // Different change types at same path = not equivalent
+            _ => false,
+        }
     }
 
     /// Compute semantic diff between two JSON values.
@@ -3763,6 +4130,614 @@ mod tests {
                 let _ = store.diff(rev_i, rev_j);
             }
         }
+    }
+
+    // ======================================================================
+    // HOSTILE TESTS: Conflict Classification (PR #12)
+    // ======================================================================
+
+    #[test]
+    fn classify_identity_same_state() {
+        // REQUIREMENT: Same state must classify deterministically with no conflict
+        // EVIDENCE: Test that identical states produce Identity relationship and no conflicts
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_identity").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let state = json!({"name": "Test", "value": 42});
+        let handle = store.create(&state).unwrap();
+
+        let classification = store.classify_conflicts(handle.state_id, handle.state_id).unwrap();
+
+        assert_eq!(classification.relationship, StateRelationship::Identity);
+        assert!(classification.left_changes.is_empty());
+        assert!(classification.right_changes.is_empty());
+        assert!(classification.path_conflicts.is_empty());
+        assert!(!classification.has_conflicts());
+    }
+
+    #[test]
+    fn classify_fast_forward_ancestor_to_descendant() {
+        // REQUIREMENT: Ancestor relationship should not be called a conflict
+        // EVIDENCE: Left is ancestor of right, classification shows no conflict
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_ff").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"version": 1})).unwrap();
+        let child = store.commit(&json!({"version": 2}), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(base.state_id, child.state_id).unwrap();
+
+        assert_eq!(classification.relationship, StateRelationship::Ancestor);
+        assert!(classification.left_changes.is_empty(), "Ancestor should have no changes");
+        assert_eq!(classification.right_changes.len(), 1, "Descendant should have one change");
+        assert!(!classification.has_conflicts(), "Fast-forward should not be a conflict");
+    }
+
+    #[test]
+    fn classify_divergent_independent_changes() {
+        // REQUIREMENT: Changes to different paths are independently compatible
+        // EVIDENCE: Two divergent branches changing different paths show no conflicts
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_independent").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"a": 1, "b": 2})).unwrap();
+        let left = store.commit(&json!({"a": 10, "b": 2}), base.state_id).unwrap();
+        let right = store.commit(&json!({"a": 1, "b": 20}), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        assert_eq!(classification.relationship, StateRelationship::Diverged);
+        assert_eq!(classification.left_changes.len(), 1);
+        assert_eq!(classification.right_changes.len(), 1);
+        assert!(classification.path_conflicts.is_empty(), "Independent changes should not create conflicts");
+        assert!(!classification.has_conflicts());
+    }
+
+    #[test]
+    fn classify_divergent_same_path_different_values() {
+        // REQUIREMENT: Same path changed to different values is a true conflict
+        // EVIDENCE: Two branches changing same path to different values show conflict
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_conflict").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Base has a field
+        let base = store.create(&json!({"status": "pending"})).unwrap();
+        // Left changes status to one value
+        let left = store.commit(&json!({"status": "approved"}), base.state_id).unwrap();
+        // Right changes status to a different value - this is a real conflict
+        let right = store.commit(&json!({"status": "rejected"}), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        assert_eq!(classification.relationship, StateRelationship::Diverged);
+        // There should be a conflict on the "status" path
+        let conflicts = classification.true_conflicts();
+        assert!(!conflicts.is_empty(), "Should have true conflicts");
+        
+        let status_conflict = conflicts.iter()
+            .find(|c| c.path.to_canonical_string() == "status");
+        assert!(status_conflict.is_some(), "Should have conflict on status path");
+        assert_eq!(status_conflict.unwrap().conflict_type, ConflictType::Conflict);
+    }
+
+    #[test]
+    fn classify_convergent_same_final_value() {
+        // REQUIREMENT: If both sides changed to same value, classify as convergent (not conflicting)
+        // EVIDENCE: Two branches changing same path to same value show convergent, not conflict
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_convergent").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Base has status and other field
+        let base = store.create(&json!({"status": "pending", "other": "base"})).unwrap();
+        // Left: status changed to approved, other unchanged
+        let left = store.commit(&json!({"status": "approved", "other": "base"}), base.state_id).unwrap();
+        // Right: status ALSO changed to approved, other also unchanged
+        let right = store.commit(&json!({"status": "approved", "other": "base"}), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        // Since the final states are identical (same content-addressed hash), relationship is Identity
+        assert_eq!(classification.relationship, StateRelationship::Identity);
+        // No changes and no conflicts
+        assert!(classification.path_conflicts.is_empty());
+        assert!(!classification.has_conflicts());
+    }
+
+    #[test]
+    fn classify_divergent_mixed_convergent_and_conflict() {
+        // REQUIREMENT D2: Multiple paths with mixed convergent+conflict behavior
+        // EVIDENCE: Some paths converge while others conflict in same divergent state
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_mixed").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Base state with two paths
+        let base = store.create(&json!({"x": 1, "y": 1})).unwrap();
+        // Left: changes both x and y to 2
+        let left = store.commit(&json!({"x": 2, "y": 2}), base.state_id).unwrap();
+        // Right: changes x to 2 (converges) but y to 3 (conflicts)
+        let right = store.commit(&json!({"x": 2, "y": 3}), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        assert_eq!(classification.relationship, StateRelationship::Diverged);
+        
+        // Check that we have exactly 2 path conflicts (one convergent, one conflict)
+        assert_eq!(classification.path_conflicts.len(), 2, "Should have 2 path conflicts");
+        
+        // Get the individual conflicts
+        let x_path_conflict = classification.path_conflicts.iter()
+            .find(|c| c.path.to_canonical_string() == "x")
+            .expect("Should have conflict entry for x path");
+        let y_path_conflict = classification.path_conflicts.iter()
+            .find(|c| c.path.to_canonical_string() == "y")
+            .expect("Should have conflict entry for y path");
+        
+        // x should be Convergent (both sides reached 2)
+        assert_eq!(x_path_conflict.conflict_type, ConflictType::Convergent, "x should be convergent");
+        
+        // y should be Conflict (left→2, right→3)
+        assert_eq!(y_path_conflict.conflict_type, ConflictType::Conflict, "y should be conflicting");
+        
+        // Verify accessor methods correctly separate convergent from true conflicts
+        let convergent = classification.convergent_changes();
+        assert_eq!(convergent.len(), 1, "Should have 1 convergent change");
+        assert_eq!(convergent[0].path.to_canonical_string(), "x", "Convergent change should be on x");
+        
+        let true_conflicts = classification.true_conflicts();
+        assert_eq!(true_conflicts.len(), 1, "Should have 1 true conflict");
+        assert_eq!(true_conflicts[0].path.to_canonical_string(), "y", "True conflict should be on y");
+        
+        // Overall: has_conflicts() must return true (because of y)
+        assert!(classification.has_conflicts(), "Classification should report having conflicts");
+        
+        // Repeated classification must be deterministic
+        let classification2 = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+        assert_eq!(classification2.path_conflicts.len(), classification.path_conflicts.len());
+        assert_eq!(
+            classification2.true_conflicts().len(),
+            classification.true_conflicts().len(),
+            "Repeated classification should produce identical true_conflicts count"
+        );
+        assert_eq!(
+            classification2.convergent_changes().len(),
+            classification.convergent_changes().len(),
+            "Repeated classification should produce identical convergent_changes count"
+        );
+    }
+
+    #[test]
+    fn classify_delete_vs_modify() {
+        // REQUIREMENT: Delete vs modify at same path is a conflict
+        // EVIDENCE: One branch deletes, other modifies same path -> conflict
+        // Base: {"x": 1}
+        // Left: {} (deleted x)
+        // Right: {"x": 2} (modified x)
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_delete_modify").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.commit(&json!({}), base.state_id).unwrap();
+        let right = store.commit(&json!({"x": 2}), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        assert_eq!(classification.relationship, StateRelationship::Diverged);
+        let conflicts = classification.true_conflicts();
+        assert!(!conflicts.is_empty(), "Delete vs modify should be a conflict");
+        
+        let x_conflict = conflicts.iter()
+            .find(|c| c.path.to_canonical_string() == "x");
+        assert!(x_conflict.is_some(), "Conflict should be on path 'x'");
+    }
+
+    #[test]
+    fn classify_modify_vs_delete() {
+        // REQUIREMENT: Modify vs delete (opposite order) is also a conflict
+        // EVIDENCE: One branch modifies, other deletes same path -> conflict
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_modify_delete").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"y": 5})).unwrap();
+        let left = store.commit(&json!({"y": 10}), base.state_id).unwrap();
+        let right = store.commit(&json!({}), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        assert_eq!(classification.relationship, StateRelationship::Diverged);
+        let conflicts = classification.true_conflicts();
+        assert!(!conflicts.is_empty(), "Modify vs delete should be a conflict");
+        
+        let y_conflict = conflicts.iter()
+            .find(|c| c.path.to_canonical_string() == "y");
+        assert!(y_conflict.is_some(), "Conflict should be on path 'y'");
+    }
+
+    #[test]
+    fn classify_type_changes() {
+        // REQUIREMENT: Type changes (1 vs "1", false vs null, etc) are conflicts
+        // EVIDENCE: Same path with different types shows conflict
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_type_conflict").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"value": 1, "other": "base"})).unwrap();
+        let left = store.commit(&json!({"value": "1", "other": "base"}), base.state_id).unwrap();
+        let right = store.commit(&json!({"value": 1, "other": "changed"}), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        // Left changed value to a different type (number to string)
+        // Right didn't change value (kept number, same as base) but changed other
+        // So "value" is only changed on left, not a conflict
+        // The real conflict test would be if both sides changed the type differently
+        
+        // For a real type conflict, make both sides change the same path to different types:
+        let base2 = store.create(&json!({"field": 0})).unwrap();
+        let left2 = store.commit(&json!({"field": "text"}), base2.state_id).unwrap();
+        let right2 = store.commit(&json!({"field": false}), base2.state_id).unwrap();
+        
+        let classification2 = store.classify_conflicts(left2.state_id, right2.state_id).unwrap();
+        
+        let conflicts = classification2.true_conflicts();
+        assert!(!conflicts.is_empty(), "Type change on same path should be a conflict");
+    }
+
+    #[test]
+    fn classify_nested_structure_conflicts() {
+        // REQUIREMENT: Conflicts in nested structures must be detected
+        // EVIDENCE: Conflicting changes in nested objects are properly classified
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_nested").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"user": {"name": "Alice", "age": 30}})).unwrap();
+        let left = store.commit(&json!({"user": {"name": "Alice", "age": 31}}), base.state_id).unwrap();
+        let right = store.commit(&json!({"user": {"name": "Bob", "age": 30}}), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        assert_eq!(classification.relationship, StateRelationship::Diverged);
+        // Should have one conflict on "user.age" path and one on "user.name" path
+        // But they're independent changes, so no conflicts if on different subpaths
+        // Actually wait - they ARE on different subpaths, so they should not conflict
+        assert!(classification.path_conflicts.is_empty(), "Different nested paths are independent");
+    }
+
+    #[test]
+    fn classify_nested_same_path_conflict() {
+        // REQUIREMENT: Same nested path changed to different values is a conflict
+        // EVIDENCE: Conflicting changes at nested path level
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_nested_conflict").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"user": {"role": "admin"}})).unwrap();
+        let left = store.commit(&json!({"user": {"role": "user"}}), base.state_id).unwrap();
+        let right = store.commit(&json!({"user": {"role": "guest"}}), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        let conflicts = classification.true_conflicts();
+        assert!(!conflicts.is_empty(), "Same nested path with different values is a conflict");
+        
+        let role_conflict = conflicts.iter()
+            .find(|c| c.path.to_canonical_string() == "user.role");
+        assert!(role_conflict.is_some());
+    }
+
+    #[test]
+    fn classify_array_position_changes() {
+        // REQUIREMENT: Arrays are position-sensitive (PR #11 semantics)
+        // EVIDENCE: Changes at same array index are detected
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_array").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!([1, 2, 3])).unwrap();
+        let left = store.commit(&json!([1, 20, 3]), base.state_id).unwrap();
+        let right = store.commit(&json!([1, 2, 30]), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        // Changes at different indices [1] vs [2], so no conflict
+        assert!(classification.path_conflicts.is_empty(), "Different array indices are independent");
+    }
+
+    #[test]
+    fn classify_array_same_index_conflict() {
+        // REQUIREMENT: Same array index changed to different values is a conflict
+        // EVIDENCE: Conflicting changes at array index level
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_array_conflict").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!([1, 2, 3])).unwrap();
+        let left = store.commit(&json!([1, 20, 3]), base.state_id).unwrap();
+        let right = store.commit(&json!([1, 200, 3]), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        let conflicts = classification.true_conflicts();
+        assert!(!conflicts.is_empty(), "Same array index with different values is a conflict");
+    }
+
+    #[test]
+    fn classify_unrelated_states_no_base() {
+        // CONTRACT: Unrelated states have no common ancestor
+        // EXPLICIT ARCHITECTURAL DECISION: Unrelated states are classified using two-way comparison against empty (null) base
+        // base_state = None
+        // left_changes = diff_from_empty(left_state)
+        // right_changes = diff_from_empty(right_state)
+        // This is NOT an error - it's a valid classification mode.
+        
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_unrelated").unwrap();
+        
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+        
+        // Create state A in the store
+        let state_a_value = json!({"a": 1});
+        let state_a = store.create(&state_a_value).unwrap();
+        
+        // Create an independent state that shares NO ancestry with state_a
+        let state_b_value = json!({"x": 10});
+        let state_b = store.create(&state_b_value).unwrap();
+        
+        // Both states were created from null, so they're unrelated
+        let classification = store.classify_conflicts(state_a.state_id, state_b.state_id).unwrap();
+        
+        // PROVEN CONTRACT:
+        assert_eq!(classification.relationship, StateRelationship::Unrelated,
+            "Independent root states should be classified as Unrelated");
+        
+        // base_state must be None (not an error, but explicitly None)
+        assert_eq!(classification.base_state, None,
+            "Unrelated states must have base_state = None (no common ancestor)");
+        
+        // left_changes should be the diff from empty/null to state_a
+        assert!(!classification.left_changes.is_empty(),
+            "Unrelated left state should have changes from empty base");
+        
+        // right_changes should be the diff from empty/null to state_b
+        assert!(!classification.right_changes.is_empty(),
+            "Unrelated right state should have changes from empty base");
+        
+        // When both sides change the root to completely different objects, 
+        // it is a CONFLICT (root path conflict)
+        let conflicts = classification.true_conflicts();
+        assert!(!conflicts.is_empty(),
+            "Unrelated states with different root objects should have root-level conflict");
+        
+        // The conflict is at the root path
+        let root_conflict = conflicts.iter()
+            .find(|c| c.path.to_canonical_string() == "");
+        assert!(root_conflict.is_some(), 
+            "Should have conflict at root path when objects are entirely different");
+        
+        // Verify the classification is deterministic
+        let classification2 = store.classify_conflicts(state_a.state_id, state_b.state_id).unwrap();
+        assert_eq!(classification2.relationship, StateRelationship::Unrelated);
+        assert_eq!(classification2.base_state, None);
+        assert_eq!(classification.left_changes.len(), classification2.left_changes.len());
+        assert_eq!(classification.right_changes.len(), classification2.right_changes.len());
+        assert_eq!(classification.path_conflicts.len(), classification2.path_conflicts.len(),
+            "Classification of same unrelated states must be deterministic");
+    }
+
+
+
+
+
+    #[test]
+    fn classify_authority_neutrality() {
+        // REQUIREMENT: Authority does NOT determine conflict classification
+        // EVIDENCE: Same states/ancestry with different authorities produce same classification
+        let temp_dir = TempDir::new().unwrap();
+        let authority_alice = AuthorityId::new("alice_authority").unwrap();
+        let authority_bob = AuthorityId::new("bob_authority").unwrap();
+
+        let mut store1 = StateStore::new(temp_dir.path().join("store1"), authority_alice).unwrap();
+        let mut store2 = StateStore::new(temp_dir.path().join("store2"), authority_bob).unwrap();
+
+        let base = json!({"status": "open"});
+        let left_state = json!({"status": "closed"});
+        let right_state = json!({"status": "archived"});
+
+        let base1 = store1.create(&base).unwrap();
+        let left1 = store1.commit(&left_state, base1.state_id).unwrap();
+        let right1 = store1.commit(&right_state, base1.state_id).unwrap();
+
+        let base2 = store2.create(&base).unwrap();
+        let left2 = store2.commit(&left_state, base2.state_id).unwrap();
+        let right2 = store2.commit(&right_state, base2.state_id).unwrap();
+
+        let class1 = store1.classify_conflicts(left1.state_id, right1.state_id).unwrap();
+        let class2 = store2.classify_conflicts(left2.state_id, right2.state_id).unwrap();
+
+        // Both should have same relationship and same conflicts
+        assert_eq!(class1.relationship, class2.relationship);
+        assert_eq!(class1.path_conflicts.len(), class2.path_conflicts.len());
+        assert_eq!(class1.has_conflicts(), class2.has_conflicts());
+    }
+
+    #[test]
+    fn classify_deterministic_ordering() {
+        // REQUIREMENT: Ordering of classifications must be deterministic
+        // EVIDENCE: Same state pair always produces same ordering of path_conflicts
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_determinism").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"z": 1, "a": 2, "m": 3})).unwrap();
+        let left = store.commit(&json!({"z": 10, "a": 20, "m": 30}), base.state_id).unwrap();
+        let right = store.commit(&json!({"z": 100, "a": 200, "m": 300}), base.state_id).unwrap();
+
+        let class1 = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+        let class2 = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        // Should have same number of changes
+        assert_eq!(class1.left_changes.len(), class2.left_changes.len());
+        assert_eq!(class1.right_changes.len(), class2.right_changes.len());
+
+        // Changes should be in same order
+        for (i, (c1, c2)) in class1.left_changes.iter().zip(class2.left_changes.iter()).enumerate() {
+            assert_eq!(c1.path(), c2.path(), "Change {} path order differs", i);
+        }
+
+        // Path conflicts should be sorted
+        let mut sorted_conflicts = class1.path_conflicts.clone();
+        sorted_conflicts.sort();
+        assert_eq!(class1.path_conflicts, sorted_conflicts, "Path conflicts not sorted");
+    }
+
+    #[test]
+    fn classify_repeated_invocation_identical() {
+        // REQUIREMENT: Repeated classification must produce identical results
+        // EVIDENCE: Multiple calls to classify_conflicts produce identical results
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_repeat").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"counter": 0})).unwrap();
+        let left = store.commit(&json!({"counter": 1}), base.state_id).unwrap();
+        let right = store.commit(&json!({"counter": 2}), base.state_id).unwrap();
+
+        let class1 = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+        let class2 = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        assert_eq!(class1.relationship, class2.relationship);
+        assert_eq!(class1.left_changes, class2.left_changes);
+        assert_eq!(class1.right_changes, class2.right_changes);
+        assert_eq!(class1.path_conflicts, class2.path_conflicts);
+    }
+
+    #[test]
+    fn classify_readonly_no_side_effects() {
+        // REQUIREMENT: Classification must be read-only, no durable mutations
+        // EVIDENCE: Current pointer and stored states unchanged after classification
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_readonly").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"test": 1})).unwrap();
+        let left = store.commit(&json!({"test": 2}), base.state_id).unwrap();
+        let right = store.commit(&json!({"test": 3}), base.state_id).unwrap();
+
+        let current_before = store.current().unwrap();
+
+        // Classify conflicts
+        let _classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        let current_after = store.current().unwrap();
+
+        // Current pointer should not have changed
+        assert_eq!(current_before.state_id, current_after.state_id);
+        assert_eq!(current_before.state, current_after.state);
+
+        // Both left and right should still exist and be unchanged
+        let left_verify = store.get(left.state_id).unwrap();
+        assert_eq!(left_verify.state, left.state);
+
+        let right_verify = store.get(right.state_id).unwrap();
+        assert_eq!(right_verify.state, right.state);
+    }
+
+    #[test]
+    fn classify_missing_state_error() {
+        // REQUIREMENT: Missing states must error (not silent fallback)
+        // EVIDENCE: Non-existent state_id produces error
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_missing").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let state = store.create(&json!({"data": 1})).unwrap();
+        let fake_id = StateId::from_hex("0000000000000000000000000000000000000000000000000000000000000000").unwrap();
+
+        let result = store.classify_conflicts(state.state_id, fake_id);
+        assert!(result.is_err(), "Should error on missing state");
+    }
+
+    #[test]
+    fn classify_empty_vs_null() {
+        // REQUIREMENT: Type sensitivity - {} is not null, [] is not null
+        // EVIDENCE: Changing null to empty object/array is a change
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_empty_vs_null").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!(null)).unwrap();
+        let left = store.commit(&json!({}), base.state_id).unwrap();
+        let right = store.commit(&json!([]), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        // Left changes null to empty object
+        // Right changes null to empty array
+        // These are different, so should be a conflict
+        let conflicts = classification.true_conflicts();
+        assert!(!conflicts.is_empty(), "Different empty type changes should conflict");
+    }
+
+    #[test]
+    fn classify_no_merge_attempted() {
+        // REQUIREMENT: Classification must NOT attempt to merge
+        // EVIDENCE: Conflicting states remain separate, unmodified
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("classify_no_merge").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"field": 1})).unwrap();
+        let left = store.commit(&json!({"field": 10, "extra": "left"}), base.state_id).unwrap();
+        let right = store.commit(&json!({"field": 20, "extra": "right"}), base.state_id).unwrap();
+
+        let classification = store.classify_conflicts(left.state_id, right.state_id).unwrap();
+
+        // Classification should identify conflicts but not create a merged state
+        assert!(classification.has_conflicts());
+
+        // Both original states should be unchanged
+        let left_verify = store.get(left.state_id).unwrap();
+        assert_eq!(left_verify.state.get("extra").unwrap(), "left");
+
+        let right_verify = store.get(right.state_id).unwrap();
+        assert_eq!(right_verify.state.get("extra").unwrap(), "right");
+
+        // No new state should have been created
+        assert_eq!(
+            left_verify.state_id, left.state_id,
+            "Left state should be unchanged"
+        );
+        assert_eq!(
+            right_verify.state_id, right.state_id,
+            "Right state should be unchanged"
+        );
     }
 }
 
