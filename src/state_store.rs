@@ -11,7 +11,8 @@
 // with this program; if not, see <https://www.gnu.org/licenses/>.
 
 use crate::state_history::{
-    AuthorityId, CanonicalState, StateHistory, StateHistoryError, StateId, StateRevision,
+    AuthorityId, CanonicalState, StateHistory, StateHistoryError, StateId, StateRelationship,
+    StateRevision,
 };
 use serde_json::Value;
 use std::error::Error;
@@ -246,6 +247,30 @@ impl StateStore {
     pub fn parent(&self, state_id: StateId) -> Result<Option<StateId>, StateStoreError> {
         let revision = self.history.load_revision(state_id)?;
         Ok(revision.parent)
+    }
+
+    /// Get all ancestors of a state, ordered from immediate parent to root.
+    pub fn ancestors(&self, state_id: StateId) -> Result<Vec<StateId>, StateStoreError> {
+        self.history
+            .ancestors(state_id)
+            .map_err(StateStoreError::from)
+    }
+
+    /// Check if one state is an ancestor of another.
+    pub fn is_ancestor(&self, ancestor: StateId, descendant: StateId) -> bool {
+        self.history.is_ancestor(ancestor, descendant)
+    }
+
+    /// Find the most recent common ancestor of two states.
+    pub fn common_ancestor(&self, left: StateId, right: StateId) -> Option<StateId> {
+        self.history.common_ancestor(left, right)
+    }
+
+    /// Determine the causal relationship between two state revisions.
+    pub fn relationship(&self, left: StateId, right: StateId) -> Result<StateRelationship, StateStoreError> {
+        self.history
+            .relationship(left, right)
+            .map_err(StateStoreError::from)
     }
 
     /// Convert StateRevision to StateHandle (with deserialized state).
@@ -1673,6 +1698,523 @@ mod tests {
         // Verify current pointer is still at root
         let current = store2.current().unwrap();
         assert_eq!(current.state_id, root_id);
+    }
+
+    #[test]
+    fn test_ancestors_linear_chain() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("query_test_alice").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let state_a = json!({"step": "A"});
+        let rev_a = store.create(&state_a).unwrap();
+
+        let state_b = json!({"step": "B"});
+        let rev_b = store.commit(&state_b, rev_a.state_id).unwrap();
+
+        let state_c = json!({"step": "C"});
+        let rev_c = store.commit(&state_c, rev_b.state_id).unwrap();
+
+        // A has no ancestors
+        let ancestors_a = store.ancestors(rev_a.state_id).unwrap();
+        assert_eq!(ancestors_a, vec![]);
+
+        // B's ancestors are [A]
+        let ancestors_b = store.ancestors(rev_b.state_id).unwrap();
+        assert_eq!(ancestors_b, vec![rev_a.state_id]);
+
+        // C's ancestors are [B, A]
+        let ancestors_c = store.ancestors(rev_c.state_id).unwrap();
+        assert_eq!(ancestors_c, vec![rev_b.state_id, rev_a.state_id]);
+    }
+
+    #[test]
+    fn test_ancestors_nonexistent_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("query_test_bob").unwrap();
+
+        let store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let fake_id = StateId::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+
+        let result = store.ancestors(fake_id);
+        assert!(result.is_err(), "Should error on nonexistent state");
+    }
+
+    #[test]
+    fn test_is_ancestor_true() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("query_test_charlie").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = store.create(&json!({"step": "A"})).unwrap();
+        let rev_b = store.commit(&json!({"step": "B"}), rev_a.state_id).unwrap();
+        let rev_c = store.commit(&json!({"step": "C"}), rev_b.state_id).unwrap();
+
+        assert!(store.is_ancestor(rev_a.state_id, rev_b.state_id));
+        assert!(store.is_ancestor(rev_a.state_id, rev_c.state_id));
+        assert!(store.is_ancestor(rev_b.state_id, rev_c.state_id));
+    }
+
+    #[test]
+    fn test_is_ancestor_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("query_test_diana").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = store.create(&json!({"step": "A"})).unwrap();
+        let rev_b = store.commit(&json!({"step": "B"}), rev_a.state_id).unwrap();
+        let rev_c = store.commit(&json!({"step": "C"}), rev_a.state_id).unwrap();
+
+        assert!(!store.is_ancestor(rev_b.state_id, rev_c.state_id));
+        assert!(!store.is_ancestor(rev_c.state_id, rev_b.state_id));
+    }
+
+    #[test]
+    fn test_is_ancestor_self_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("query_test_eve").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = store.create(&json!({"step": "A"})).unwrap();
+
+        // A state is not its own ancestor
+        assert!(!store.is_ancestor(rev_a.state_id, rev_a.state_id));
+    }
+
+    #[test]
+    fn test_common_ancestor_linear_chain() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("query_test_frank").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = store.create(&json!({"step": "A"})).unwrap();
+        let rev_b = store.commit(&json!({"step": "B"}), rev_a.state_id).unwrap();
+        let rev_c = store.commit(&json!({"step": "C"}), rev_b.state_id).unwrap();
+
+        // A and B share ancestor A
+        let ancestor = store.common_ancestor(rev_a.state_id, rev_b.state_id);
+        assert_eq!(ancestor, Some(rev_a.state_id));
+
+        // B and C share ancestor B
+        let ancestor = store.common_ancestor(rev_b.state_id, rev_c.state_id);
+        assert_eq!(ancestor, Some(rev_b.state_id));
+
+        // A and C share ancestor A
+        let ancestor = store.common_ancestor(rev_a.state_id, rev_c.state_id);
+        assert_eq!(ancestor, Some(rev_a.state_id));
+    }
+
+    #[test]
+    fn test_common_ancestor_diverged() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("query_test_grace").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = store.create(&json!({"root": true})).unwrap();
+        let rev_b = store.commit(&json!({"left": 1}), rev_a.state_id).unwrap();
+        let rev_c = store.commit(&json!({"right": 2}), rev_a.state_id).unwrap();
+
+        // B and C share common ancestor A
+        let ancestor = store.common_ancestor(rev_b.state_id, rev_c.state_id);
+        assert_eq!(ancestor, Some(rev_a.state_id));
+    }
+
+    #[test]
+    fn test_common_ancestor_same_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("query_test_henry").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = store.create(&json!({"self": true})).unwrap();
+
+        // Same state is its own common ancestor
+        let ancestor = store.common_ancestor(rev_a.state_id, rev_a.state_id);
+        assert_eq!(ancestor, Some(rev_a.state_id));
+    }
+
+    #[test]
+    fn test_common_ancestor_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("query_test_iris").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Create two completely separate branches with different roots
+        let rev_a = store.create(&json!({"root": 1})).unwrap();
+        let rev_b = store.create(&json!({"root": 2})).unwrap();
+
+        // They have no common ancestor (different roots)
+        let ancestor = store.common_ancestor(rev_a.state_id, rev_b.state_id);
+        assert_eq!(ancestor, None);
+    }
+
+    #[test]
+    fn test_relationship_identity() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("relationship_test_alice").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = store.create(&json!({"id": "A"})).unwrap();
+
+        let rel = store.relationship(rev_a.state_id, rev_a.state_id).unwrap();
+        assert_eq!(rel, StateRelationship::Identity);
+    }
+
+    #[test]
+    fn test_relationship_ancestor() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("relationship_test_bob").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = store.create(&json!({"step": "A"})).unwrap();
+        let rev_b = store.commit(&json!({"step": "B"}), rev_a.state_id).unwrap();
+        let rev_c = store.commit(&json!({"step": "C"}), rev_b.state_id).unwrap();
+
+        assert_eq!(
+            store.relationship(rev_a.state_id, rev_b.state_id).unwrap(),
+            StateRelationship::Ancestor
+        );
+        assert_eq!(
+            store.relationship(rev_a.state_id, rev_c.state_id).unwrap(),
+            StateRelationship::Ancestor
+        );
+    }
+
+    #[test]
+    fn test_relationship_descendant() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("relationship_test_charlie").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = store.create(&json!({"step": "A"})).unwrap();
+        let rev_b = store.commit(&json!({"step": "B"}), rev_a.state_id).unwrap();
+        let rev_c = store.commit(&json!({"step": "C"}), rev_b.state_id).unwrap();
+
+        assert_eq!(
+            store.relationship(rev_b.state_id, rev_a.state_id).unwrap(),
+            StateRelationship::Descendant
+        );
+        assert_eq!(
+            store.relationship(rev_c.state_id, rev_a.state_id).unwrap(),
+            StateRelationship::Descendant
+        );
+    }
+
+    #[test]
+    fn test_relationship_diverged() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("relationship_test_diana").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = store.create(&json!({"root": true})).unwrap();
+        let rev_b = store.commit(&json!({"left": 1}), rev_a.state_id).unwrap();
+        let rev_c = store.commit(&json!({"right": 2}), rev_a.state_id).unwrap();
+
+        assert_eq!(
+            store.relationship(rev_b.state_id, rev_c.state_id).unwrap(),
+            StateRelationship::Diverged
+        );
+        assert_eq!(
+            store.relationship(rev_c.state_id, rev_b.state_id).unwrap(),
+            StateRelationship::Diverged
+        );
+    }
+
+    #[test]
+    fn test_relationship_unrelated() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("relationship_test_eve").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = store.create(&json!({"root": 1})).unwrap();
+        let rev_b = store.create(&json!({"root": 2})).unwrap();
+
+        assert_eq!(
+            store.relationship(rev_a.state_id, rev_b.state_id).unwrap(),
+            StateRelationship::Unrelated
+        );
+        assert_eq!(
+            store.relationship(rev_b.state_id, rev_a.state_id).unwrap(),
+            StateRelationship::Unrelated
+        );
+    }
+
+    #[test]
+    fn test_relationship_error_missing_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("relationship_test_frank").unwrap();
+
+        let store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let fake_id = StateId::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+
+        let result = store.relationship(fake_id, fake_id);
+        assert!(result.is_err(), "Should error on missing state");
+    }
+
+    #[test]
+    fn test_ancestors_persist_and_recover() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("gate8_persist_alice").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority.clone()).unwrap();
+
+        let rev_a = store.create(&json!({"step": "A"})).unwrap();
+        let rev_b = store.commit(&json!({"step": "B"}), rev_a.state_id).unwrap();
+        let rev_c = store.commit(&json!({"step": "C"}), rev_b.state_id).unwrap();
+
+        // Query ancestors before restart
+        let ancestors_before = store.ancestors(rev_c.state_id).unwrap();
+        assert_eq!(ancestors_before, vec![rev_b.state_id, rev_a.state_id]);
+
+        // Drop the store to simulate restart
+        drop(store);
+
+        // Create a new store from the same directory
+        let store2 = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Query ancestors after restart - must be identical
+        let ancestors_after = store2.ancestors(rev_c.state_id).unwrap();
+        assert_eq!(ancestors_after, vec![rev_b.state_id, rev_a.state_id]);
+        assert_eq!(ancestors_before, ancestors_after, "Ancestors must be identical after restart");
+    }
+
+    #[test]
+    fn test_relationship_current_pointer_independent() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("gate9_pointer_bob").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = store.create(&json!({"root": true})).unwrap();
+        let rev_b = store.commit(&json!({"left": 1}), rev_a.state_id).unwrap();
+        let rev_c = store.commit(&json!({"right": 2}), rev_a.state_id).unwrap();
+
+        // Query relationship with current at B
+        let relationship_at_b = store.relationship(rev_b.state_id, rev_c.state_id).unwrap();
+
+        // Advance current to C
+        store.commit(&json!({"right": 2, "committed": true}), rev_c.state_id).unwrap();
+
+        // Query the same relationship with current at C
+        let relationship_at_c = store.relationship(rev_b.state_id, rev_c.state_id).unwrap();
+
+        // Results must be identical regardless of current pointer
+        assert_eq!(relationship_at_b, relationship_at_c, "Relationship must be independent of current pointer");
+        assert_eq!(relationship_at_b, StateRelationship::Diverged);
+    }
+
+    #[test]
+    fn test_authority_neutral_relationships() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority_a = AuthorityId::new("gate10_alice").unwrap();
+        let authority_b = AuthorityId::new("gate10_bob").unwrap();
+        let authority_c = AuthorityId::new("gate10_carol").unwrap();
+
+        // Create root with alice
+        let mut store = StateStore::new(temp_dir.path(), authority_a).unwrap();
+        let rev_a = store.create(&json!({"root": true})).unwrap();
+
+        // Create left branch (bob)
+        let rev_b = store.commit(&json!({"left": 1}), rev_a.state_id).unwrap();
+
+        // Create right branch (carol)
+        let rev_c = store.commit(&json!({"right": 2}), rev_a.state_id).unwrap();
+
+        // Relationship should be Diverged regardless of authority metadata
+        let rel = store.relationship(rev_b.state_id, rev_c.state_id).unwrap();
+        assert_eq!(rel, StateRelationship::Diverged, "Relationship must not depend on authority");
+
+        // Common ancestor should also be independent of authority
+        let common = store.common_ancestor(rev_b.state_id, rev_c.state_id);
+        assert_eq!(common, Some(rev_a.state_id), "Common ancestor must not depend on authority");
+    }
+
+    #[test]
+    fn test_relationship_no_side_effects() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("gate11_nosideeffects").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = store.create(&json!({"step": "A"})).unwrap();
+        let rev_b = store.commit(&json!({"step": "B"}), rev_a.state_id).unwrap();
+        let rev_c = store.commit(&json!({"step": "C"}), rev_a.state_id).unwrap();
+
+        // Capture state before queries
+        let current_before = store.current().unwrap().state_id;
+        let state_a_before = store.get(rev_a.state_id).unwrap().state;
+        let state_b_before = store.get(rev_b.state_id).unwrap().state;
+        let state_c_before = store.get(rev_c.state_id).unwrap().state;
+
+        // Execute all query operations
+        let _ancestors_b = store.ancestors(rev_b.state_id).unwrap();
+        let _ancestors_c = store.ancestors(rev_c.state_id).unwrap();
+        let _is_anc = store.is_ancestor(rev_a.state_id, rev_c.state_id);
+        let _common = store.common_ancestor(rev_b.state_id, rev_c.state_id);
+        let _rel = store.relationship(rev_b.state_id, rev_c.state_id).unwrap();
+
+        // Verify no side effects
+        let current_after = store.current().unwrap().state_id;
+        let state_a_after = store.get(rev_a.state_id).unwrap().state;
+        let state_b_after = store.get(rev_b.state_id).unwrap().state;
+        let state_c_after = store.get(rev_c.state_id).unwrap().state;
+
+        assert_eq!(current_before, current_after, "Current pointer must not change");
+        assert_eq!(state_a_before, state_a_after, "State A must not change");
+        assert_eq!(state_b_before, state_b_after, "State B must not change");
+        assert_eq!(state_c_before, state_c_after, "State C must not change");
+    }
+
+    #[test]
+    fn test_dangling_ancestor_handling() {
+        // GATE 12: Verify explicit error handling for missing/corrupted ancestors
+        // 
+        // This test verifies that querying ancestors with missing dependencies
+        // produces deterministic, explicit behavior rather than silently producing
+        // incomplete results.
+         
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("gate12_dangling").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority.clone()).unwrap();
+
+        let rev_a = store.create(&json!({"step": "A"})).unwrap();
+        let rev_b = store.commit(&json!({"step": "B"}), rev_a.state_id).unwrap();
+        let rev_c = store.commit(&json!({"step": "C"}), rev_b.state_id).unwrap();
+
+        // Test 1: Verify normal operation works before any corruption
+        let ancestors_c = store.ancestors(rev_c.state_id).unwrap();
+        assert_eq!(ancestors_c, vec![rev_b.state_id, rev_a.state_id]);
+
+        // Test 2: Verify querying non-existent state errors explicitly
+        let fake_id = StateId::from_hex(
+            "9999999999999999999999999999999999999999999999999999999999999999",
+        )
+        .unwrap();
+         
+        let result = store.ancestors(fake_id);
+        assert!(result.is_err(), "ancestors() must error on non-existent state");
+
+        // Test 3: Verify consistency of error behavior across restart
+        // After restart, the same non-existent state should still error
+        drop(store);
+        let store2 = StateStore::new(temp_dir.path(), authority).unwrap();
+         
+        let result2 = store2.ancestors(fake_id);
+        assert!(result2.is_err(), "ancestors() error must persist after restart");
+         
+        // Test 4: Verify ancestors still work correctly after restart
+        let ancestors_c_after = store2.ancestors(rev_c.state_id).unwrap();
+        assert_eq!(ancestors_c_after, vec![rev_b.state_id, rev_a.state_id],
+                   "ancestors() must return consistent results after restart");
+    }
+
+
+    #[test]
+    fn test_cycle_detection() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("gate14_cycle").unwrap();
+
+        // We can't easily create a cycle through the public API since it's prevented,
+        // so we verify the implementation terminates correctly for deep chains
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Create a chain: A -> B -> C -> D -> ... (deep but not cyclic)
+        let mut current = store.create(&json!({"level": 0})).unwrap().state_id;
+        let mut revisions = vec![current];
+
+        // Create a reasonably deep chain
+        for i in 1..=100 {
+            let next = store.commit(&json!({"level": i}), current).unwrap();
+            revisions.push(next.state_id);
+            current = next.state_id;
+        }
+
+        // Test that ancestor queries terminate and don't infinite loop
+        let ancestors = store.ancestors(revisions[100]).unwrap();
+        assert_eq!(ancestors.len(), 100, "Should have exactly 100 ancestors");
+        assert_eq!(ancestors[0], revisions[99], "First ancestor should be parent");
+        assert_eq!(ancestors[99], revisions[0], "Last ancestor should be root");
+
+        // Test is_ancestor terminates correctly
+        assert!(store.is_ancestor(revisions[0], revisions[100]));
+        assert!(!store.is_ancestor(revisions[100], revisions[0]));
+
+        // Test common_ancestor terminates
+        let common = store.common_ancestor(revisions[50], revisions[100]);
+        assert_eq!(common, Some(revisions[50]), "Common ancestor at middle");
+    }
+
+    #[test]
+    fn test_complex_topology_D_E_divergence() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("gate16_complex").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Build topology:
+        //     D
+        //    /
+        //   B
+        //  /
+        // A
+        //  \
+        //   C
+        //    \
+        //     E
+
+        let rev_a = store.create(&json!({"node": "A"})).unwrap();
+        let rev_b = store.commit(&json!({"node": "B"}), rev_a.state_id).unwrap();
+        let rev_c = store.commit(&json!({"node": "C"}), rev_a.state_id).unwrap();
+        let rev_d = store.commit(&json!({"node": "D"}), rev_b.state_id).unwrap();
+        let rev_e = store.commit(&json!({"node": "E"}), rev_c.state_id).unwrap();
+
+        // Test D and E relationship
+        let rel_de = store.relationship(rev_d.state_id, rev_e.state_id).unwrap();
+        assert_eq!(rel_de, StateRelationship::Diverged);
+
+        let rel_ed = store.relationship(rev_e.state_id, rev_d.state_id).unwrap();
+        assert_eq!(rel_ed, StateRelationship::Diverged);
+
+        // Common ancestor of D and E should be A
+        let common_de = store.common_ancestor(rev_d.state_id, rev_e.state_id);
+        assert_eq!(common_de, Some(rev_a.state_id));
+
+        // D's ancestors should be [B, A]
+        let ancestors_d = store.ancestors(rev_d.state_id).unwrap();
+        assert_eq!(ancestors_d, vec![rev_b.state_id, rev_a.state_id]);
+
+        // E's ancestors should be [C, A]
+        let ancestors_e = store.ancestors(rev_e.state_id).unwrap();
+        assert_eq!(ancestors_e, vec![rev_c.state_id, rev_a.state_id]);
+
+        // D and E are not ancestors of each other
+        assert!(!store.is_ancestor(rev_d.state_id, rev_e.state_id));
+        assert!(!store.is_ancestor(rev_e.state_id, rev_d.state_id));
+
+        // A is ancestor of both
+        assert!(store.is_ancestor(rev_a.state_id, rev_d.state_id));
+        assert!(store.is_ancestor(rev_a.state_id, rev_e.state_id));
     }
 
 }

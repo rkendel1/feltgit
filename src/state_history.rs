@@ -284,6 +284,33 @@ impl StateRevision {
     }
 }
 
+/// Describes the causal relationship between two state revisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateRelationship {
+    /// The two states are identical (same StateId).
+    Identity,
+    /// The left state is an ancestor of the right state.
+    Ancestor,
+    /// The left state is a descendant of the right state.
+    Descendant,
+    /// The states diverged from a common ancestor but neither is an ancestor of the other.
+    Diverged,
+    /// The states have no causal relationship (no common ancestor in the history).
+    Unrelated,
+}
+
+impl Display for StateRelationship {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StateRelationship::Identity => write!(f, "Identity"),
+            StateRelationship::Ancestor => write!(f, "Ancestor"),
+            StateRelationship::Descendant => write!(f, "Descendant"),
+            StateRelationship::Diverged => write!(f, "Diverged"),
+            StateRelationship::Unrelated => write!(f, "Unrelated"),
+        }
+    }
+}
+
 /// A durable state history storage.
 /// Manages persistence and retrieval of state revisions.
 pub struct StateHistory {
@@ -399,6 +426,114 @@ impl StateHistory {
         }
 
         Ok(())
+    }
+
+    /// Get all ancestors of a state, ordered from immediate parent to root.
+    /// Returns an error if the state is not found.
+    /// Returns an empty vector if the state is a root (has no parents).
+    pub fn ancestors(&self, state_id: StateId) -> Result<Vec<StateId>, StateHistoryError> {
+       let mut ancestors = Vec::new();
+       let mut current = state_id;
+
+       loop {
+           let revision = self.revisions
+               .get(&current)
+               .ok_or(StateHistoryError::PersistenceError(
+                   "revision not found".to_string(),
+               ))?;
+
+           match revision.parent {
+               Some(parent_id) => {
+                   ancestors.push(parent_id);
+                   current = parent_id;
+               }
+               None => break,
+           }
+       }
+
+       Ok(ancestors)
+    }
+
+    /// Check if one state is an ancestor of another.
+    /// Returns false if either state does not exist.
+    pub fn is_ancestor(&self, ancestor: StateId, descendant: StateId) -> bool {
+       if ancestor == descendant {
+           return false;
+       }
+
+       match self.ancestors(descendant) {
+           Ok(ancestors) => ancestors.iter().any(|&a| a == ancestor),
+           Err(_) => false,
+       }
+    }
+
+    /// Find the most recent common ancestor of two states.
+    /// Returns None if the states have no common ancestor or if either state doesn't exist.
+    pub fn common_ancestor(&self, left: StateId, right: StateId) -> Option<StateId> {
+       if left == right {
+           return Some(left);
+       }
+
+       // Check if left is an ancestor of right
+       if self.is_ancestor(left, right) {
+           return Some(left);
+       }
+
+       // Check if right is an ancestor of left
+       if self.is_ancestor(right, left) {
+           return Some(right);
+       }
+
+       // Get all ancestors for both states
+       let left_ancestors = match self.ancestors(left) {
+           Ok(ancestors) => ancestors,
+           Err(_) => return None,
+       };
+
+       let right_ancestors = match self.ancestors(right) {
+           Ok(ancestors) => ancestors,
+           Err(_) => return None,
+       };
+
+       // Find the most recent (earliest in the list) common ancestor
+       for &left_ancestor in &left_ancestors {
+           if right_ancestors.iter().any(|&r| r == left_ancestor) {
+               return Some(left_ancestor);
+           }
+       }
+
+       None
+    }
+
+    /// Determine the causal relationship between two state revisions.
+    /// Returns an error if either state does not exist.
+    pub fn relationship(&self, left: StateId, right: StateId) -> Result<StateRelationship, StateHistoryError> {
+       // Verify both states exist first
+       let _ = self.load_revision(left)?;
+       let _ = self.load_revision(right)?;
+
+       // Check if they're the same
+       if left == right {
+           return Ok(StateRelationship::Identity);
+       }
+
+       // Check if left is an ancestor of right
+       if self.is_ancestor(left, right) {
+           return Ok(StateRelationship::Ancestor);
+       }
+
+       // Check if left is a descendant of right
+       if self.is_ancestor(right, left) {
+           return Ok(StateRelationship::Descendant);
+       }
+
+       // Check if they have a common ancestor (diverged)
+       if self.common_ancestor(left, right).is_some() {
+           return Ok(StateRelationship::Diverged);
+       }
+
+       // No relationship
+       Ok(StateRelationship::Unrelated)
     }
 }
 
@@ -1306,4 +1441,115 @@ mod tests {
             "StateHistory must work independently of Git infrastructure"
         );
     }
+
+    #[test]
+    fn test_history_ancestors_linear_chain() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("history_query_alice").unwrap();
+
+        let mut history = StateHistory::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = history.create_revision(&json!({"step": "A"}), None).unwrap();
+        let rev_b = history
+            .create_revision(&json!({"step": "B"}), Some(rev_a.state_id))
+            .unwrap();
+        let rev_c = history
+            .create_revision(&json!({"step": "C"}), Some(rev_b.state_id))
+            .unwrap();
+
+        let ancestors_a = history.ancestors(rev_a.state_id).unwrap();
+        assert_eq!(ancestors_a, vec![]);
+
+        let ancestors_b = history.ancestors(rev_b.state_id).unwrap();
+        assert_eq!(ancestors_b, vec![rev_a.state_id]);
+
+        let ancestors_c = history.ancestors(rev_c.state_id).unwrap();
+        assert_eq!(ancestors_c, vec![rev_b.state_id, rev_a.state_id]);
+    }
+
+    #[test]
+    fn test_history_is_ancestor() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("history_query_bob").unwrap();
+
+        let mut history = StateHistory::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = history.create_revision(&json!({"step": "A"}), None).unwrap();
+        let rev_b = history
+            .create_revision(&json!({"step": "B"}), Some(rev_a.state_id))
+            .unwrap();
+        let rev_c = history
+            .create_revision(&json!({"step": "C"}), Some(rev_b.state_id))
+            .unwrap();
+
+        assert!(history.is_ancestor(rev_a.state_id, rev_b.state_id));
+        assert!(history.is_ancestor(rev_a.state_id, rev_c.state_id));
+        assert!(history.is_ancestor(rev_b.state_id, rev_c.state_id));
+
+        assert!(!history.is_ancestor(rev_b.state_id, rev_a.state_id));
+        assert!(!history.is_ancestor(rev_a.state_id, rev_a.state_id));
+    }
+
+    #[test]
+    fn test_history_common_ancestor() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("history_query_charlie").unwrap();
+
+        let mut history = StateHistory::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = history.create_revision(&json!({"root": true}), None).unwrap();
+        let rev_b = history
+            .create_revision(&json!({"left": 1}), Some(rev_a.state_id))
+            .unwrap();
+        let rev_c = history
+            .create_revision(&json!({"right": 2}), Some(rev_a.state_id))
+            .unwrap();
+
+        assert_eq!(
+            history.common_ancestor(rev_a.state_id, rev_a.state_id),
+            Some(rev_a.state_id)
+        );
+        assert_eq!(
+            history.common_ancestor(rev_a.state_id, rev_b.state_id),
+            Some(rev_a.state_id)
+        );
+        assert_eq!(
+            history.common_ancestor(rev_b.state_id, rev_c.state_id),
+            Some(rev_a.state_id)
+        );
+    }
+
+    #[test]
+    fn test_history_relationship() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("history_query_diana").unwrap();
+
+        let mut history = StateHistory::new(temp_dir.path(), authority).unwrap();
+
+        let rev_a = history.create_revision(&json!({"step": "A"}), None).unwrap();
+        let rev_b = history
+            .create_revision(&json!({"step": "B"}), Some(rev_a.state_id))
+            .unwrap();
+        let rev_c = history
+            .create_revision(&json!({"right": 2}), Some(rev_a.state_id))
+            .unwrap();
+
+        assert_eq!(
+            history.relationship(rev_a.state_id, rev_a.state_id).unwrap(),
+            StateRelationship::Identity
+        );
+        assert_eq!(
+            history.relationship(rev_a.state_id, rev_b.state_id).unwrap(),
+            StateRelationship::Ancestor
+        );
+        assert_eq!(
+            history.relationship(rev_b.state_id, rev_a.state_id).unwrap(),
+            StateRelationship::Descendant
+        );
+        assert_eq!(
+            history.relationship(rev_b.state_id, rev_c.state_id).unwrap(),
+            StateRelationship::Diverged
+        );
+    }
 }
+
