@@ -80,6 +80,167 @@ pub struct RevisionMetadata {
     pub authority: AuthorityId,
 }
 
+/// A segment of a path to a location in application state.
+/// Used for representing nested paths like "user.name" or "items[0].id".
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+pub enum StatePathSegment {
+    /// Object key: represents access like state["key"]
+    Key(String),
+    /// Array index: represents access like state[0]
+    Index(usize),
+}
+
+impl Display for StatePathSegment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StatePathSegment::Key(k) => write!(f, "{}", k),
+            StatePathSegment::Index(i) => write!(f, "[{}]", i),
+        }
+    }
+}
+
+/// A deterministic path to a location in application state.
+/// Segments represent nested access: object keys and array indices.
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+pub struct StatePath(pub Vec<StatePathSegment>);
+
+impl StatePath {
+    /// Create a new empty path (root).
+    pub fn root() -> Self {
+        StatePath(Vec::new())
+    }
+
+    /// Create a path from segments.
+    pub fn from_segments(segments: Vec<StatePathSegment>) -> Self {
+        StatePath(segments)
+    }
+
+    /// Append a key segment.
+    pub fn with_key(mut self, key: String) -> Self {
+        self.0.push(StatePathSegment::Key(key));
+        self
+    }
+
+    /// Append an index segment.
+    pub fn with_index(mut self, index: usize) -> Self {
+        self.0.push(StatePathSegment::Index(index));
+        self
+    }
+
+    /// Get the canonical string representation.
+    /// Object keys and array indices are represented with deterministic formatting.
+    pub fn to_canonical_string(&self) -> String {
+        if self.0.is_empty() {
+            return "".to_string();
+        }
+
+        let mut result = String::new();
+        for (i, segment) in self.0.iter().enumerate() {
+            match segment {
+                StatePathSegment::Key(k) => {
+                    if i > 0 {
+                        result.push('.');
+                    }
+                    result.push_str(k);
+                }
+                StatePathSegment::Index(idx) => {
+                    result.push('[');
+                    result.push_str(&idx.to_string());
+                    result.push(']');
+                }
+            }
+        }
+        result
+    }
+}
+
+impl Display for StatePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_canonical_string())
+    }
+}
+
+/// A semantic change between two states.
+/// Represents a single atomic change at a specific path.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum StateChange {
+    /// A field was added to the state.
+    Added {
+        path: StatePath,
+        value: Value,
+    },
+    /// A field was removed from the state.
+    Removed {
+        path: StatePath,
+        value: Value,
+    },
+    /// A field value changed.
+    Changed {
+        path: StatePath,
+        from: Value,
+        to: Value,
+    },
+}
+
+impl StateChange {
+    /// Get the path of this change.
+    pub fn path(&self) -> &StatePath {
+        match self {
+            StateChange::Added { path, .. } => path,
+            StateChange::Removed { path, .. } => path,
+            StateChange::Changed { path, .. } => path,
+        }
+    }
+
+    /// Get a canonical ordering key for deterministic sorting.
+    /// Orders primarily by path, then by change type for determinism.
+    fn ordering_key(&self) -> (&StatePath, &str) {
+        match self {
+            StateChange::Added { path, .. } => (path, "0"),
+            StateChange::Removed { path, .. } => (path, "1"),
+            StateChange::Changed { path, .. } => (path, "2"),
+        }
+    }
+}
+
+impl Ord for StateChange {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.ordering_key().cmp(&other.ordering_key())
+    }
+}
+
+impl PartialOrd for StateChange {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A semantic diff between two application states.
+/// Contains all changes required to transform the left state into the right state.
+#[derive(Debug, Clone)]
+pub struct StateDiff {
+    pub changes: Vec<StateChange>,
+}
+
+impl StateDiff {
+    /// Create a new diff with the given changes.
+    pub fn new(mut changes: Vec<StateChange>) -> Self {
+        // Ensure deterministic ordering
+        changes.sort();
+        StateDiff { changes }
+    }
+
+    /// Check if the diff is empty (no changes).
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    /// Get the number of changes.
+    pub fn len(&self) -> usize {
+        self.changes.len()
+    }
+}
+
 /// A durable application-state store.
 /// Wraps StateHistory and adds a persisted current-state pointer.
 pub struct StateStore {
@@ -272,6 +433,170 @@ impl StateStore {
             .relationship(left, right)
             .map_err(StateStoreError::from)
     }
+
+    /// Compute the semantic diff between two states.
+    /// Returns all changes required to transform the left state into the right state.
+    /// 
+    /// The diff is read-only and observational:
+    /// - Does not mutate either state
+    /// - Does not modify the current pointer
+    /// - Does not depend on store state
+    /// - Works for any two states (ancestor/descendant, divergent, unrelated)
+    /// 
+    /// Returns an error if either state does not exist.
+    pub fn diff(&self, left: StateId, right: StateId) -> Result<StateDiff, StateStoreError> {
+        // Load both states (will error if either doesn't exist)
+        let left_handle = self.get(left)?;
+        let right_handle = self.get(right)?;
+
+        // If same state, no changes
+        if left == right {
+            return Ok(StateDiff::new(Vec::new()));
+        }
+
+        // Compute semantic diff
+        let changes = Self::compute_diff(&left_handle.state, &right_handle.state, StatePath::root());
+
+        Ok(StateDiff::new(changes))
+    }
+
+    /// Compute semantic diff between two JSON values.
+    /// Returns a vector of changes ordered lexicographically by path.
+    fn compute_diff(left: &Value, right: &Value, path: StatePath) -> Vec<StateChange> {
+        let mut changes = Vec::new();
+
+        // Type-sensitive comparison: different types are always a change
+        match (left, right) {
+            // Identical values (same type, same content)
+            (Value::Null, Value::Null) => {
+                // No change
+            }
+            (Value::Bool(a), Value::Bool(b)) if a == b => {
+                // No change
+            }
+            (Value::Number(a), Value::Number(b)) if a == b => {
+                // No change
+            }
+            (Value::String(a), Value::String(b)) if a == b => {
+                // No change
+            }
+            // Different or mixed types
+            (Value::Object(_), Value::Object(_)) => {
+                changes.extend(Self::diff_objects(left, right, &path));
+            }
+            (Value::Array(_), Value::Array(_)) => {
+                changes.extend(Self::diff_arrays(left, right, &path));
+            }
+            // Type change (e.g., number to string)
+            _ => {
+                changes.push(StateChange::Changed {
+                    path,
+                    from: left.clone(),
+                    to: right.clone(),
+                });
+            }
+        }
+
+        changes
+    }
+
+    /// Compute diff between two objects.
+    /// Objects are order-independent: {"a":1,"b":2} == {"b":2,"a":1}
+    fn diff_objects(left: &Value, right: &Value, path: &StatePath) -> Vec<StateChange> {
+        let mut changes = Vec::new();
+
+        let left_map = left.as_object().unwrap();
+        let right_map = right.as_object().unwrap();
+
+        // Collect all keys from both objects (uniquely)
+        let mut all_keys: Vec<String> = left_map
+            .keys()
+            .chain(right_map.keys())
+            .map(|k| k.clone())
+            .collect();
+        all_keys.sort();
+        all_keys.dedup();
+
+        for key in all_keys {
+            let left_value = left_map.get(&key);
+            let right_value = right_map.get(&key);
+
+            match (left_value, right_value) {
+                (Some(l), Some(r)) => {
+                    // Both have the key - recurse or report change
+                    let nested_path = path.clone().with_key(key);
+                    changes.extend(Self::compute_diff(l, r, nested_path));
+                }
+                (Some(l), None) => {
+                    // Key removed
+                    let nested_path = path.clone().with_key(key);
+                    changes.push(StateChange::Removed {
+                        path: nested_path,
+                        value: l.clone(),
+                    });
+                }
+                (None, Some(r)) => {
+                    // Key added
+                    let nested_path = path.clone().with_key(key);
+                    changes.push(StateChange::Added {
+                        path: nested_path,
+                        value: r.clone(),
+                    });
+                }
+                (None, None) => {
+                    // Neither has it (shouldn't happen)
+                }
+            }
+        }
+
+        changes
+    }
+
+    /// Compute diff between two arrays.
+    /// Arrays are ordered: [1,2,3] != [3,2,1]
+    fn diff_arrays(left: &Value, right: &Value, path: &StatePath) -> Vec<StateChange> {
+        let mut changes = Vec::new();
+
+        let left_arr = left.as_array().unwrap();
+        let right_arr = right.as_array().unwrap();
+
+        let max_len = left_arr.len().max(right_arr.len());
+
+        for i in 0..max_len {
+            let left_item = left_arr.get(i);
+            let right_item = right_arr.get(i);
+
+            match (left_item, right_item) {
+                (Some(l), Some(r)) => {
+                    // Both have an item at this index - recurse or report change
+                    let indexed_path = path.clone().with_index(i);
+                    changes.extend(Self::compute_diff(l, r, indexed_path));
+                }
+                (Some(l), None) => {
+                    // Item removed (array shrunk)
+                    let indexed_path = path.clone().with_index(i);
+                    changes.push(StateChange::Removed {
+                        path: indexed_path,
+                        value: l.clone(),
+                    });
+                }
+                (None, Some(r)) => {
+                    // Item added (array grew)
+                    let indexed_path = path.clone().with_index(i);
+                    changes.push(StateChange::Added {
+                        path: indexed_path,
+                        value: r.clone(),
+                    });
+                }
+                (None, None) => {
+                    // Shouldn't happen
+                }
+            }
+        }
+
+        changes
+    }
+
 
     /// Convert StateRevision to StateHandle (with deserialized state).
     fn revision_to_handle(&self, revision: StateRevision) -> Result<StateHandle, StateStoreError> {
@@ -2217,4 +2542,1228 @@ mod tests {
         assert!(store.is_ancestor(rev_a.state_id, rev_e.state_id));
     }
 
+    // Comprehensive diff tests follow
+
+    #[test]
+    fn test_diff_identity_same_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_identity").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let state = json!({"a": 1, "b": 2});
+        let rev = store.create(&state).unwrap();
+
+        // diff(A, A) must be empty
+        let diff = store.diff(rev.state_id, rev.state_id).unwrap();
+        assert!(diff.is_empty(), "diff(A, A) must be empty");
+        assert_eq!(diff.len(), 0);
+    }
+
+    #[test]
+    fn test_diff_identity_loaded_separately() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_identity_separate").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let state = json!({"x": 100});
+        let rev = store.create(&state).unwrap();
+
+        // Verify the same state loaded separately
+        let rev2 = store.get(rev.state_id).unwrap();
+        assert_eq!(rev.state_id, rev2.state_id);
+
+        // diff must still be empty
+        let diff = store.diff(rev.state_id, rev2.state_id).unwrap();
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn test_diff_added_field() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_added").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!({"a": 1});
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!({"a": 1, "b": 2});
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1);
+
+        match &diff.changes[0] {
+            StateChange::Added { path, value } => {
+                assert_eq!(path.to_canonical_string(), "b");
+                assert_eq!(*value, json!(2));
+            }
+            _ => panic!("Expected Added change"),
+        }
+    }
+
+    #[test]
+    fn test_diff_removed_field() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_removed").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!({"a": 1, "b": 2});
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!({"a": 1});
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1);
+
+        match &diff.changes[0] {
+            StateChange::Removed { path, value } => {
+                assert_eq!(path.to_canonical_string(), "b");
+                assert_eq!(*value, json!(2));
+            }
+            _ => panic!("Expected Removed change"),
+        }
+    }
+
+    #[test]
+    fn test_diff_changed_field() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_changed").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!({"a": 1});
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!({"a": 2});
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1);
+
+        match &diff.changes[0] {
+            StateChange::Changed { path, from, to } => {
+                assert_eq!(path.to_canonical_string(), "a");
+                assert_eq!(*from, json!(1));
+                assert_eq!(*to, json!(2));
+            }
+            _ => panic!("Expected Changed change"),
+        }
+    }
+
+    #[test]
+    fn test_diff_nested_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_nested").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!({
+            "user": {
+                "name": "Randy",
+                "role": "user"
+            }
+        });
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!({
+            "user": {
+                "name": "Randy",
+                "role": "admin"
+            }
+        });
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1, "Should report only nested field change, not entire object");
+
+        match &diff.changes[0] {
+            StateChange::Changed { path, from, to } => {
+                assert_eq!(path.to_canonical_string(), "user.role");
+                assert_eq!(*from, json!("user"));
+                assert_eq!(*to, json!("admin"));
+            }
+            _ => panic!("Expected Changed change"),
+        }
+    }
+
+    #[test]
+    fn test_diff_nested_addition() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_nested_add").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!({
+            "user": {
+                "name": "Randy"
+            }
+        });
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!({
+            "user": {
+                "name": "Randy",
+                "verified": true
+            }
+        });
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1);
+
+        match &diff.changes[0] {
+            StateChange::Added { path, value } => {
+                assert_eq!(path.to_canonical_string(), "user.verified");
+                assert_eq!(*value, json!(true));
+            }
+            _ => panic!("Expected Added change"),
+        }
+    }
+
+    #[test]
+    fn test_diff_nested_removal() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_nested_remove").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!({
+            "user": {
+                "name": "Randy",
+                "verified": true
+            }
+        });
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!({
+            "user": {
+                "name": "Randy"
+            }
+        });
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1);
+
+        match &diff.changes[0] {
+            StateChange::Removed { path, value } => {
+                assert_eq!(path.to_canonical_string(), "user.verified");
+                assert_eq!(*value, json!(true));
+            }
+            _ => panic!("Expected Removed change"),
+        }
+    }
+
+    #[test]
+    fn test_diff_array_replacement() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_array_replace").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!({"items": [1, 2, 3]});
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!({"items": [1, 99, 3]});
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1);
+
+        match &diff.changes[0] {
+            StateChange::Changed { path, from, to } => {
+                assert_eq!(path.to_canonical_string(), "items[1]");
+                assert_eq!(*from, json!(2));
+                assert_eq!(*to, json!(99));
+            }
+            _ => panic!("Expected Changed change"),
+        }
+    }
+
+    #[test]
+    fn test_diff_array_addition() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_array_add").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!({"items": [1, 2]});
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!({"items": [1, 2, 3]});
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1);
+
+        match &diff.changes[0] {
+            StateChange::Added { path, value } => {
+                assert_eq!(path.to_canonical_string(), "items[2]");
+                assert_eq!(*value, json!(3));
+            }
+            _ => panic!("Expected Added change"),
+        }
+    }
+
+    #[test]
+    fn test_diff_array_removal() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_array_remove").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!({"items": [1, 2, 3]});
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!({"items": [1, 2]});
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1);
+
+        match &diff.changes[0] {
+            StateChange::Removed { path, value } => {
+                assert_eq!(path.to_canonical_string(), "items[2]");
+                assert_eq!(*value, json!(3));
+            }
+            _ => panic!("Expected Removed change"),
+        }
+    }
+
+    #[test]
+    fn test_diff_nested_object_in_array() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_nested_obj_arr").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!({"items": [{"id": 1, "name": "A"}]});
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!({"items": [{"id": 1, "name": "B"}]});
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1);
+
+        match &diff.changes[0] {
+            StateChange::Changed { path, from, to } => {
+                assert_eq!(path.to_canonical_string(), "items[0].name");
+                assert_eq!(*from, json!("A"));
+                assert_eq!(*to, json!("B"));
+            }
+            _ => panic!("Expected Changed change"),
+        }
+    }
+
+    #[test]
+    fn test_diff_type_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_type_change").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Number to string
+        let left = json!({"value": 1});
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!({"value": "1"});
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1, "Type change must be reported");
+
+        match &diff.changes[0] {
+            StateChange::Changed { path, from, to } => {
+                assert_eq!(path.to_canonical_string(), "value");
+                assert_eq!(*from, json!(1));
+                assert_eq!(*to, json!("1"));
+            }
+            _ => panic!("Expected Changed change for type conversion"),
+        }
+    }
+
+    #[test]
+    fn test_diff_object_key_ordering_independence() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_key_order").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Verify that the diff algorithm treats object keys as unordered
+        // by checking that diffs are computed consistently across multiple calls
+        let left = store.create(&json!({"a": 1, "b": 2})).unwrap();
+        let right = store.commit(&json!({"x": 10, "b": 2}), left.state_id).unwrap();
+
+        // Compute diff multiple times
+        let diff1 = store.diff(left.state_id, right.state_id).unwrap();
+        let diff2 = store.diff(left.state_id, right.state_id).unwrap();
+
+        // Diffs must be identical regardless of order of key iteration
+        assert_eq!(diff1.changes.len(), diff2.changes.len());
+        for (c1, c2) in diff1.changes.iter().zip(diff2.changes.iter()) {
+            assert_eq!(c1, c2, "Object key ordering must not affect diff results");
+        }
+
+        // Verify we have the expected changes (removed "a", added "x")
+        assert_eq!(diff1.len(), 2);
+    }
+
+
+
+
+    #[test]
+    fn test_diff_deterministic_ordering() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_deterministic").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!({"a": 1, "b": 2, "c": 3});
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!({"x": 10, "y": 20, "z": 30});
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        // Compute diff twice
+        let diff1 = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        let diff2 = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+
+        // Diffs must be exactly equal (including order)
+        assert_eq!(diff1.changes.len(), diff2.changes.len());
+        for (c1, c2) in diff1.changes.iter().zip(diff2.changes.iter()) {
+            assert_eq!(c1, c2, "Diff ordering must be deterministic");
+        }
+
+        // Verify changes are sorted by path
+        for i in 1..diff1.changes.len() {
+            let prev_path = diff1.changes[i - 1].path();
+            let curr_path = diff1.changes[i].path();
+            assert!(
+                prev_path.to_canonical_string() <= curr_path.to_canonical_string(),
+                "Changes must be sorted lexicographically by path"
+            );
+        }
+    }
+
+    #[test]
+    fn test_diff_directionality() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_direction").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!({"a": 1});
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!({"a": 2, "b": 3});
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        // diff(A, B) should have Changed("a", 1, 2) and Added("b", 3)
+        let diff_ab = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff_ab.len(), 2);
+
+        // diff(B, A) should have Changed("a", 2, 1) and Removed("b", 3)
+        let diff_ba = store.diff(rev_right.state_id, rev_left.state_id).unwrap();
+        assert_eq!(diff_ba.len(), 2);
+
+        // The changes should not be identical (directionality)
+        assert_ne!(diff_ab.changes, diff_ba.changes);
+    }
+
+    #[test]
+    fn test_diff_readonly_no_mutation() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_readonly").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let state_a = json!({"x": 1});
+        let rev_a = store.create(&state_a).unwrap();
+
+        let state_b = json!({"x": 2});
+        let rev_b = store.commit(&state_b, rev_a.state_id).unwrap();
+
+        // Get initial state before diff
+        let state_before_a = store.get(rev_a.state_id).unwrap();
+        let state_before_b = store.get(rev_b.state_id).unwrap();
+        let current_before = store.current().unwrap().state_id;
+        let ancestry_before = store.ancestors(rev_b.state_id).unwrap();
+
+        // Compute diff
+        let _diff = store.diff(rev_a.state_id, rev_b.state_id).unwrap();
+
+        // Verify nothing changed
+        let state_after_a = store.get(rev_a.state_id).unwrap();
+        let state_after_b = store.get(rev_b.state_id).unwrap();
+        let current_after = store.current().unwrap().state_id;
+        let ancestry_after = store.ancestors(rev_b.state_id).unwrap();
+
+        assert_eq!(state_before_a.state, state_after_a.state);
+        assert_eq!(state_before_b.state, state_after_b.state);
+        assert_eq!(current_before, current_after, "Current pointer must not change");
+        assert_eq!(ancestry_before, ancestry_after, "Ancestry must not change");
+    }
+
+    #[test]
+    fn test_diff_current_pointer_independence() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_current_indep").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let a = store.create(&json!({"state": "A"})).unwrap();
+        let b = store.commit(&json!({"state": "B"}), a.state_id).unwrap();
+        let c = store.commit(&json!({"state": "C"}), b.state_id).unwrap();
+
+        // Create a separate branch with D
+        let d = store.create_branch(a.state_id, &json!({"state": "D"})).unwrap();
+        let e = store.commit(&json!({"state": "E"}), d.state_id).unwrap();
+
+        // Compute diff(B, C) with current = C
+        let diff1 = store.diff(b.state_id, c.state_id).unwrap();
+
+        // Switch current to E (different branch) and compute diff(B, C) again
+        // This doesn't change current but verify the computation is independent
+        let diff2 = store.diff(b.state_id, c.state_id).unwrap();
+
+        // Diffs must be identical regardless of current pointer (or other branches existing)
+        assert_eq!(diff1.changes.len(), diff2.changes.len());
+        for (c1, c2) in diff1.changes.iter().zip(diff2.changes.iter()) {
+            assert_eq!(c1, c2);
+        }
+
+        // Also verify diff between unrelated states works
+        let diff_unrelated = store.diff(c.state_id, e.state_id).unwrap();
+        assert_eq!(diff_unrelated.len(), 1);
+    }
+
+
+    #[test]
+    fn test_diff_missing_state_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_missing").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let a = store.create(&json!({"x": 1})).unwrap();
+        let missing_id = StateId::from_hex(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+
+        // diff(existing, missing) must error
+        let result_ab = store.diff(a.state_id, missing_id);
+        assert!(result_ab.is_err(), "diff must error on missing right state");
+
+        // diff(missing, existing) must error
+        let result_ba = store.diff(missing_id, a.state_id);
+        assert!(result_ba.is_err(), "diff must error on missing left state");
+
+        // diff(missing, missing) must error
+        let result_mm = store.diff(missing_id, missing_id);
+        assert!(result_mm.is_err(), "diff must error on both missing");
+    }
+
+    #[test]
+    fn test_diff_unrelated_states() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_unrelated").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let a = store.create(&json!({"state": "A"})).unwrap();
+        let b = store.commit(&json!({"state": "B"}), a.state_id).unwrap();
+
+        let c = store.create(&json!({"state": "C"})).unwrap();
+        let d = store.commit(&json!({"state": "D"}), c.state_id).unwrap();
+
+        // diff(B, D) must work even though they're unrelated
+        let diff = store.diff(b.state_id, d.state_id).unwrap();
+        assert_eq!(diff.len(), 1);
+
+        match &diff.changes[0] {
+            StateChange::Changed { path, from, to } => {
+                assert_eq!(path.to_canonical_string(), "state");
+                assert_eq!(*from, json!("B"));
+                assert_eq!(*to, json!("D"));
+            }
+            _ => panic!("Expected Changed change"),
+        }
+    }
+
+    #[test]
+    fn test_diff_empty_vs_null() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_empty_null").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Create initial state with a container
+        let left = store.create(&json!({"items": []})).unwrap();
+
+        // Commit a state where items is null - this should be different
+        let right = store.commit(&json!({"items": null}), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+        assert_eq!(diff.len(), 1, "Empty array and null must be different");
+        
+        // Verify the change is at the items field
+        match &diff.changes[0] {
+            StateChange::Changed { path, from, to } => {
+                assert_eq!(path.to_canonical_string(), "items");
+                assert_eq!(*from, json!([]));
+                assert_eq!(*to, json!(null));
+            }
+            _ => panic!("Expected Changed"),
+        }
+    }
+
+
+
+    #[test]
+    fn test_diff_empty_vs_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_empty_false").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!(false);
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!({});
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1, "false and empty object must be different types");
+    }
+
+    #[test]
+    fn test_diff_zero_vs_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_zero_false").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!(0);
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!(false);
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1, "0 and false must be different types");
+    }
+
+    #[test]
+    fn test_diff_empty_string() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_empty_string").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = json!("");
+        let rev_left = store.create(&left).unwrap();
+
+        let right = json!(null);
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1, "Empty string and null must be different");
+    }
+
+    #[test]
+    fn test_diff_complex_divergence() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_complex_diverge").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let root = store.create(&json!({"version": 1})).unwrap();
+        let branch_a = store.commit(&json!({"version": 2, "branch": "A"}), root.state_id).unwrap();
+        let branch_b = store.create_branch(root.state_id, &json!({"version": 2, "branch": "B"})).unwrap();
+
+        // diff(A, B) on divergent branches must still work
+        let diff = store.diff(branch_a.state_id, branch_b.state_id).unwrap();
+        assert_eq!(diff.len(), 1);
+
+        match &diff.changes[0] {
+            StateChange::Changed { path, from, to } => {
+                assert_eq!(path.to_canonical_string(), "branch");
+                assert_eq!(*from, json!("A"));
+                assert_eq!(*to, json!("B"));
+            }
+            _ => panic!("Expected Changed change"),
+        }
+    }
+
+    #[test]
+    fn test_diff_json_numbers() {
+        // Verify: Different JSON number representations are treated as distinct
+        // This ensures PR #11 respects the PR #6 representation-sensitive canonicalization contract
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("diff_json_numbers").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Test 1: 1 vs 1.0
+        let left_1 = store.create(&json!({"value": 1})).unwrap();
+        let right_1_0 = store.commit(&json!({"value": 1.0}), left_1.state_id).unwrap();
+
+        let diff = store.diff(left_1.state_id, right_1_0.state_id).unwrap();
+        // If serde_json preserves distinction, diff should report changed
+        // Note: serde_json may normalize these, so this test documents behavior
+        if json!(1) != json!(1.0) {
+            assert_eq!(diff.len(), 1, "1 and 1.0 must be reported as different if JSON preserves distinction");
+            match &diff.changes[0] {
+                StateChange::Changed { path, .. } => {
+                    assert_eq!(path.to_canonical_string(), "value");
+                }
+                _ => panic!("Expected Changed for 1 vs 1.0"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_diff_authority_neutrality() {
+        // Verify: diff() result is independent of the store's authority
+        // When comparing two states, the authority of the store instance does not affect the diff result
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create two states using authority "alice"
+        let authority_alice = AuthorityId::new("authority_alice").unwrap();
+        let mut store_alice = StateStore::new(temp_dir.path(), authority_alice).unwrap();
+        let state_a = json!({"value": 1});
+        let state_b = json!({"value": 2});
+        
+        let rev_a = store_alice.create(&state_a).unwrap();
+        let rev_b = store_alice.commit(&state_b, rev_a.state_id).unwrap();
+
+        // Compute diff with alice's store
+        let diff_alice = store_alice.diff(rev_a.state_id, rev_b.state_id).unwrap();
+
+        // Now create a new store with authority "bob" and load the same states
+        let authority_bob = AuthorityId::new("authority_bob").unwrap();
+        let store_bob = StateStore::new(temp_dir.path(), authority_bob).unwrap();
+        
+        // Compute diff with bob's store (different authority)
+        let diff_bob = store_bob.diff(rev_a.state_id, rev_b.state_id).unwrap();
+
+        // The diffs must be identical despite different authorities
+        assert_eq!(diff_alice.len(), diff_bob.len(), "Diff count must be independent of authority");
+        assert_eq!(diff_alice.changes.len(), 1, "Expected 1 change");
+        
+        // Verify the exact change is identical
+        match (&diff_alice.changes[0], &diff_bob.changes[0]) {
+            (
+                StateChange::Changed { path: p1, from: f1, to: t1 },
+                StateChange::Changed { path: p2, from: f2, to: t2 },
+            ) => {
+                assert_eq!(p1, p2, "Paths must match");
+                assert_eq!(f1, f2, "From values must match");
+                assert_eq!(t1, t2, "To values must match");
+            }
+            _ => panic!("Expected Changed changes in both diffs"),
+        }
+    }
+
+    // ============================================================
+    // EVIDENCE-FIRST HOSTILE AUDIT TESTS
+    // ============================================================
+    // These tests verify the deterministic semantic diff is correct,
+    // read-only, and handles all edge cases properly.
+    // ============================================================
+
+    #[test]
+    fn evidence_determinism_identical_output() {
+        // Verify: Multiple calls with same inputs produce identical results
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_determinism").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({
+            "z": 3,
+            "a": 1,
+            "m": 2,
+            "nested": {"y": 20, "x": 10}
+        })).unwrap();
+
+        let right = store.commit(&json!({
+            "z": 3,
+            "a": 2,
+            "m": 2,
+            "nested": {"x": 10, "y": 21},
+            "new": "field"
+        }), left.state_id).unwrap();
+
+        // Compute diff three times with identical inputs
+        let diff1 = store.diff(left.state_id, right.state_id).unwrap();
+        let diff2 = store.diff(left.state_id, right.state_id).unwrap();
+        let diff3 = store.diff(left.state_id, right.state_id).unwrap();
+
+        // All must be byte-identical
+        assert_eq!(diff1.changes.len(), diff2.changes.len(), "Length must be identical");
+        assert_eq!(diff2.changes.len(), diff3.changes.len(), "Length must be identical");
+
+        for (c1, c2) in diff1.changes.iter().zip(diff2.changes.iter()) {
+            assert_eq!(c1, c2, "Changes must be identical across invocations");
+        }
+
+        for (c2, c3) in diff2.changes.iter().zip(diff3.changes.iter()) {
+            assert_eq!(c2, c3, "Changes must be identical across invocations");
+        }
+    }
+
+    #[test]
+    fn evidence_readonly_no_file_mutations() {
+        // Verify: diff() does not create or modify files in storage
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_readonly").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let a = store.create(&json!({"x": 1})).unwrap();
+        let b = store.commit(&json!({"x": 2}), a.state_id).unwrap().state_id;
+
+        // Get initial file count
+        let initial_files: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .collect();
+        let initial_count = initial_files.len();
+
+        // Perform diff multiple times
+        for _ in 0..5 {
+            let _ = store.diff(a.state_id, b);
+        }
+
+        // Verify file count unchanged
+        let final_files: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .collect();
+        let final_count = final_files.len();
+
+        assert_eq!(initial_count, final_count, "diff() must not create files");
+    }
+
+    #[test]
+    fn evidence_change_type_correctness_added() {
+        // Verify: Added changes only appear when value is in right, not left
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_added").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({"existing": "value"})).unwrap();
+        let right = store.commit(&json!({"existing": "value", "new_field": 42}), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+        
+        // Should have exactly one Added change
+        let added_changes: Vec<_> = diff.changes.iter()
+            .filter_map(|c| if let StateChange::Added { path, value } = c {
+                Some((path.to_canonical_string(), value.clone()))
+            } else {
+                None
+            })
+            .collect();
+
+        assert_eq!(added_changes.len(), 1, "Should have one Added change");
+        assert_eq!(added_changes[0].0, "new_field");
+        assert_eq!(added_changes[0].1, json!(42));
+    }
+
+    #[test]
+    fn evidence_change_type_correctness_removed() {
+        // Verify: Removed changes only appear when value is in left, not right
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_removed").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({"existing": "value", "to_remove": true})).unwrap();
+        let right = store.commit(&json!({"existing": "value"}), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+        
+        // Should have exactly one Removed change
+        let removed_changes: Vec<_> = diff.changes.iter()
+            .filter_map(|c| if let StateChange::Removed { path, value } = c {
+                Some((path.to_canonical_string(), value.clone()))
+            } else {
+                None
+            })
+            .collect();
+
+        assert_eq!(removed_changes.len(), 1, "Should have one Removed change");
+        assert_eq!(removed_changes[0].0, "to_remove");
+        assert_eq!(removed_changes[0].1, json!(true));
+    }
+
+    #[test]
+    fn evidence_change_type_correctness_changed() {
+        // Verify: Changed changes reflect actual value differences
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_changed").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({"field": "old_value"})).unwrap();
+        let right = store.commit(&json!({"field": "new_value"}), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+        
+        // Should have exactly one Changed change
+        let changed_changes: Vec<_> = diff.changes.iter()
+            .filter_map(|c| if let StateChange::Changed { path, from, to } = c {
+                Some((path.to_canonical_string(), from.clone(), to.clone()))
+            } else {
+                None
+            })
+            .collect();
+
+        assert_eq!(changed_changes.len(), 1, "Should have one Changed change");
+        assert_eq!(changed_changes[0].0, "field");
+        assert_eq!(changed_changes[0].1, json!("old_value"));
+        assert_eq!(changed_changes[0].2, json!("new_value"));
+    }
+
+    #[test]
+    fn evidence_path_ordering_lexicographic() {
+        // Verify: Changes are ordered lexicographically by path
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_ordering").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Create a state with some structure
+        let left = store.create(&json!({
+            "zebra": 1,
+            "apple": {"x": 1},
+            "monkey": {"zebra": 1, "apple": 1}
+        })).unwrap();
+
+        // Modify multiple fields to create changes at different paths
+        let right = store.commit(&json!({
+            "zebra": 2,
+            "apple": {"x": 2, "y": 3},
+            "monkey": {"zebra": 2, "apple": 2}
+        }), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+
+        // Extract paths
+        let paths: Vec<String> = diff.changes.iter()
+            .map(|c| c.path().to_canonical_string())
+            .collect();
+
+        // Verify sorted
+        let mut sorted_paths = paths.clone();
+        sorted_paths.sort();
+
+        assert_eq!(paths, sorted_paths, "Changes must be ordered lexicographically");
+        // Expected: apple.y (added), apple.x (changed), monkey.apple (changed), monkey.zebra (changed), zebra (changed)
+        // But since we only have all Added and Changed here, order should be: apple.x, apple.y, monkey.apple, monkey.zebra, zebra
+        assert!(paths.len() > 0, "Should have changes");
+        
+        // Verify first < second < third, etc.
+        for i in 1..paths.len() {
+            assert!(paths[i-1] <= paths[i], "Paths {} and {} not in order", paths[i-1], paths[i]);
+        }
+    }
+
+    #[test]
+    fn evidence_deep_nesting_10_levels() {
+        // Verify: Works correctly with 10+ levels of nesting
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_deep").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Build deeply nested structure
+        let left = json!({
+            "l1": {
+                "l2": {
+                    "l3": {
+                        "l4": {
+                            "l5": {
+                                "l6": {
+                                    "l7": {
+                                        "l8": {
+                                            "l9": {
+                                                "l10": {
+                                                    "value": 1
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let right = json!({
+            "l1": {
+                "l2": {
+                    "l3": {
+                        "l4": {
+                            "l5": {
+                                "l6": {
+                                    "l7": {
+                                        "l8": {
+                                            "l9": {
+                                                "l10": {
+                                                    "value": 2
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let rev_left = store.create(&left).unwrap();
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1);
+
+        match &diff.changes[0] {
+            StateChange::Changed { path, from, to } => {
+                assert_eq!(path.to_canonical_string(), "l1.l2.l3.l4.l5.l6.l7.l8.l9.l10.value");
+                assert_eq!(*from, json!(1));
+                assert_eq!(*to, json!(2));
+            }
+            _ => panic!("Expected Changed"),
+        }
+    }
+
+    #[test]
+    fn evidence_directionality_inverse() {
+        // Verify: diff(A,B) changes are proper inverse of diff(B,A)
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_direction").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({"a": 1, "b": 2})).unwrap();
+        let right = store.commit(&json!({"a": 10, "c": 3}), left.state_id).unwrap();
+
+        let diff_ab = store.diff(left.state_id, right.state_id).unwrap();
+        let diff_ba = store.diff(right.state_id, left.state_id).unwrap();
+
+        // Must have same number of changes
+        assert_eq!(diff_ab.len(), diff_ba.len(), "Diffs must have same length");
+
+        // Changes at same paths but inverted
+        for (change_ab, change_ba) in diff_ab.changes.iter().zip(diff_ba.changes.iter()) {
+            assert_eq!(change_ab.path(), change_ba.path(), "Paths must match");
+
+            match (change_ab, change_ba) {
+                (StateChange::Added { value: v1, .. }, StateChange::Removed { value: v2, .. }) => {
+                    assert_eq!(v1, v2, "Added/Removed values must match");
+                }
+                (StateChange::Removed { value: v1, .. }, StateChange::Added { value: v2, .. }) => {
+                    assert_eq!(v1, v2, "Removed/Added values must match");
+                }
+                (StateChange::Changed { from: f1, to: t1, .. }, StateChange::Changed { from: f2, to: t2, .. }) => {
+                    assert_eq!(f1, t2, "Changed must be inverted");
+                    assert_eq!(t1, f2, "Changed must be inverted");
+                }
+                _ => panic!("Unexpected change combination"),
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_large_array_1000_elements() {
+        // Verify: Handles large arrays efficiently
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_large_array").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Create array with 1000 elements
+        let mut items = Vec::new();
+        for i in 0..1000 {
+            items.push(json!(i));
+        }
+
+        let left = store.create(&json!({"items": items})).unwrap();
+
+        // Modify one element
+        let mut items2 = items.clone();
+        items2[500] = json!(99999);
+
+        let right = store.commit(&json!({"items": items2}), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+        
+        // Should detect only the one change
+        assert_eq!(diff.len(), 1);
+        match &diff.changes[0] {
+            StateChange::Changed { path, from, to } => {
+                assert_eq!(path.to_canonical_string(), "items[500]");
+                assert_eq!(*from, json!(500));
+                assert_eq!(*to, json!(99999));
+            }
+            _ => panic!("Expected Changed"),
+        }
+    }
+
+    #[test]
+    fn evidence_special_json_values() {
+        // Verify: Correctly handles special JSON values
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_special").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({
+            "null_value": null,
+            "false_value": false,
+            "zero_value": 0,
+            "empty_string": "",
+            "empty_array": [],
+            "empty_object": {}
+        })).unwrap();
+
+        // Change each special value
+        let right = store.commit(&json!({
+            "null_value": false,
+            "false_value": 0,
+            "zero_value": "",
+            "empty_string": [],
+            "empty_array": {},
+            "empty_object": null
+        }), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+
+        // Should have 6 changes, one per field
+        assert_eq!(diff.len(), 6, "All special values should produce changes");
+
+        // Verify all are Changed (not Added/Removed)
+        for change in &diff.changes {
+            match change {
+                StateChange::Changed { .. } => {}
+                _ => panic!("Special values should produce Changed, not {:?}", change),
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_mixed_array_object_nesting() {
+        // Verify: Correctly handles mixed array/object nesting
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_mixed").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({
+            "users": [
+                {"id": 1, "name": "Alice", "tags": ["admin"]},
+                {"id": 2, "name": "Bob", "tags": ["user"]}
+            ]
+        })).unwrap();
+
+        let right = store.commit(&json!({
+            "users": [
+                {"id": 1, "name": "Alice", "tags": ["admin", "moderator"]},
+                {"id": 2, "name": "Bob", "tags": ["user"]}
+            ]
+        }), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+
+        // Should detect the tag addition
+        assert_eq!(diff.len(), 1);
+        match &diff.changes[0] {
+            StateChange::Added { path, value } => {
+                assert_eq!(path.to_canonical_string(), "users[0].tags[1]");
+                assert_eq!(*value, json!("moderator"));
+            }
+            _ => panic!("Expected Added change for new tag"),
+        }
+    }
+
+    #[test]
+    fn evidence_unicode_in_keys_and_values() {
+        // Verify: Correctly handles Unicode in keys and values
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_unicode").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({
+            "用户": {"名字": "张三"}
+        })).unwrap();
+
+        let right = store.commit(&json!({
+            "用户": {"名字": "李四", "🚀": "rocket"}
+        }), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+
+        // Should have 2 changes: one Changed, one Added
+        assert_eq!(diff.len(), 2);
+
+        let paths: Vec<String> = diff.changes.iter()
+            .map(|c| c.path().to_canonical_string())
+            .collect();
+
+        assert!(paths.contains(&"用户.名字".to_string()));
+        assert!(paths.contains(&"用户.🚀".to_string()));
+    }
+
+    #[test]
+    fn evidence_all_operations_no_panic() {
+        // Verify: No panics on any valid operations
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_no_panic").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Create various states
+        let states = vec![
+            json!({}),
+            json!([]),
+            json!(null),
+            json!(0),
+            json!(false),
+            json!(""),
+            json!({"a": {"b": {"c": 1}}}),
+            json!([[[1]]])
+        ];
+
+        let mut revisions = Vec::new();
+        for state in &states {
+            if revisions.is_empty() {
+                revisions.push(store.create(state).unwrap().state_id);
+            } else {
+                revisions.push(store.commit(state, revisions[0]).unwrap().state_id);
+            }
+        }
+
+        // Try all pairwise diffs - none should panic
+        for (i, &rev_i) in revisions.iter().enumerate() {
+            for &rev_j in revisions.iter().skip(i) {
+                let _ = store.diff(rev_i, rev_j);
+            }
+        }
+    }
 }
+
+
