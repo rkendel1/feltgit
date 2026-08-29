@@ -151,6 +151,37 @@ impl StateStore {
         Ok(self.revision_to_handle(revision)?)
     }
 
+    /// Commit a state transition from the expected current state.
+    /// Returns error if expected_parent does not match the actual current state.
+    /// This is the atomic state transition primitive: validates parent/current
+    /// relationship, persists immutable revision, then advances current pointer.
+    /// Only updates current-state pointer if transition succeeds.
+    pub fn commit_transition(
+        &mut self,
+        expected_parent: StateId,
+        next_state: &Value,
+    ) -> Result<StateHandle, StateStoreError> {
+        // Validate that expected_parent matches current state
+        let current_id = self.current_state_id.ok_or(StateStoreError::PersistenceError(
+            "no current state (empty store)".to_string(),
+        ))?;
+
+        if current_id != expected_parent {
+            return Err(StateStoreError::ParentMismatch);
+        }
+
+        // Validate state can be canonicalized
+        let _canonical = CanonicalState::from_json(next_state)?;
+
+        // Create the revision with explicit parent
+        let revision = self.history.create_revision(next_state, Some(expected_parent))?;
+
+        // Update current pointer only on success
+        self.save_current_pointer(&revision.state_id)?;
+
+        Ok(self.revision_to_handle(revision)?)
+    }
+
     /// Get the current state.
     pub fn current(&self) -> Result<StateHandle, StateStoreError> {
         let state_id = self.current_state_id.ok_or(StateStoreError::PersistenceError(
@@ -600,6 +631,199 @@ mod tests {
         // Historical root should still be readable
         let retrieved_root = store.get(root_id).unwrap();
         assert_eq!(retrieved_root.state, json!({"restart": "test"}));
+    }
+
+    #[test]
+    fn test_commit_transition_successful() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("transition_test_alice").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let root_state = json!({"step": 1});
+        let root = store.create(&root_state).unwrap();
+
+        let child_state = json!({"step": 2});
+        let current_id = root.state_id;
+        let child = store
+            .commit_transition(current_id, &child_state)
+            .unwrap();
+
+        assert_eq!(child.parent, Some(root.state_id));
+        assert_eq!(child.state, child_state);
+
+        // Verify current pointer updated
+        let current = store.current().unwrap();
+        assert_eq!(current.state_id, child.state_id);
+    }
+
+    #[test]
+    fn test_commit_transition_parent_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("transition_test_bob").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let root = store.create(&json!({"version": 1})).unwrap();
+        let child = store
+            .commit(&json!({"version": 2}), root.state_id)
+            .unwrap();
+
+        // Try to transition from a non-current state (root) when current is child
+        let result = store.commit_transition(root.state_id, &json!({"version": 3}));
+
+        assert!(result.is_err(), "Should reject transition from non-current state");
+        match result {
+            Err(StateStoreError::ParentMismatch) => {
+                // Expected
+            }
+            _ => {
+                panic!("Expected ParentMismatch error");
+            }
+        }
+    }
+
+    #[test]
+    fn test_commit_transition_chain() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("transition_test_charlie").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let stateA = json!({"step": "A"});
+        let revA = store.create(&stateA).unwrap();
+
+        let stateB = json!({"step": "B"});
+        let revB = store
+            .commit_transition(revA.state_id, &stateB)
+            .unwrap();
+
+        let stateC = json!({"step": "C"});
+        let revC = store
+            .commit_transition(revB.state_id, &stateC)
+            .unwrap();
+
+        // Verify chain
+        assert_eq!(revA.parent, None);
+        assert_eq!(revB.parent, Some(revA.state_id));
+        assert_eq!(revC.parent, Some(revB.state_id));
+
+        // Verify current is C
+        let current = store.current().unwrap();
+        assert_eq!(current.state_id, revC.state_id);
+    }
+
+    #[test]
+    fn test_commit_transition_atomicity() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("transition_test_diana").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let root = store.create(&json!({"atomic": "test"})).unwrap();
+        let root_id = root.state_id;
+
+        let child_state = json!({"atomic": "child"});
+        let child = store
+            .commit_transition(root_id, &child_state)
+            .unwrap();
+
+        // Verify that current pointer is updated after successful transition
+        let current = store.current().unwrap();
+        assert_eq!(current.state_id, child.state_id, "Current pointer must be updated");
+
+        // Verify old state still exists (immutable)
+        let old_state = store.get(root_id).unwrap();
+        assert_eq!(old_state.state, json!({"atomic": "test"}));
+
+        // Verify new state exists
+        let new_state = store.get(child.state_id).unwrap();
+        assert_eq!(new_state.state, child_state);
+    }
+
+    #[test]
+    fn test_commit_transition_persistence() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("transition_test_eve").unwrap();
+
+        let (root_id, child_id) = {
+            let mut store = StateStore::new(temp_dir.path(), authority.clone()).unwrap();
+
+            let root = store.create(&json!({"persist": "root"})).unwrap();
+            let root_id = root.state_id;
+
+            let child = store
+                .commit_transition(root_id, &json!({"persist": "child"}))
+                .unwrap();
+
+            (root_id, child.state_id)
+        };
+
+        // Restart and verify persistence
+        let store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let current = store.current().unwrap();
+        assert_eq!(current.state_id, child_id, "Current should persist through restart");
+
+        let retrieved_child = store.get(child_id).unwrap();
+        assert_eq!(retrieved_child.state, json!({"persist": "child"}));
+
+        let retrieved_root = store.get(root_id).unwrap();
+        assert_eq!(retrieved_root.state, json!({"persist": "root"}));
+    }
+
+    #[test]
+    fn test_commit_transition_immutability() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("transition_test_frank").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let root_state = json!({"immutable": "root"});
+        let root = store.create(&root_state).unwrap();
+        let root_id = root.state_id;
+
+        let child_state = json!({"immutable": "child"});
+        let _child = store
+            .commit_transition(root_id, &child_state)
+            .unwrap();
+
+        // Verify root state is unchanged
+        let retrieved_root = store.get(root_id).unwrap();
+        assert_eq!(retrieved_root.state, root_state, "Root state should not be mutated");
+    }
+
+    #[test]
+    fn test_commit_transition_vs_commit_semantics() {
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("transition_test_grace").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let root = store.create(&json!({"test": "root"})).unwrap();
+        let child1 = store
+            .commit(&json!({"test": "child1"}), root.state_id)
+            .unwrap();
+
+        // commit_transition should fail when not at current state
+        let result = store.commit_transition(root.state_id, &json!({"test": "branch"}));
+        assert!(
+            result.is_err(),
+            "commit_transition should fail for non-current parent"
+        );
+
+        // but commit should succeed (even with non-current parent)
+        let child2 = store
+            .commit(&json!({"test": "branch"}), root.state_id)
+            .unwrap();
+
+        // Current should be child2 (the last commit updated it)
+        let current = store.current().unwrap();
+        assert_eq!(current.state_id, child2.state_id);
+
+        // Both child1 and child2 should be retrievable
+        assert_eq!(store.get(child1.state_id).unwrap().state, json!({"test": "child1"}));
+        assert_eq!(store.get(child2.state_id).unwrap().state, json!({"test": "branch"}));
     }
 
     #[test]
