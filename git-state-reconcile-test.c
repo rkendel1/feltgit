@@ -1,10 +1,3 @@
-#include "git-compat-util.h"
-#include "state-diff.h"
-#include "repository.h"
-#include "object-name.h"
-#include <stdio.h>
-#include <string.h>
-
 /*
  * Test program for state reconciliation engine with JSON output format
  * 
@@ -14,6 +7,16 @@
  *   git-state-reconcile-test dump-conflict <base_json> <left_json> <right_json>
  *   git-state-reconcile-test reconcile-commits <base_oid> <left_oid> <right_oid>
  */
+#define USE_THE_REPOSITORY_VARIABLE
+
+#include "git-compat-util.h"
+#include "state-diff.h"
+#include "repository.h"
+#include "object-name.h"
+#include <stdio.h>
+#include <string.h>
+#include <limits.h>
+#include <unistd.h>
 
 static void print_json_string(const char *str)
 {
@@ -227,18 +230,30 @@ int main(int argc, char **argv)
 	}
 
 	if (strcmp(argv[1], "reconcile-commits") == 0 && argc == 5) {
-		struct repository *repo = NULL;
 		struct object_id base_oid, left_oid, right_oid;
 		struct object_id *base_oid_ptr = NULL;
 		struct object_id *left_oid_ptr = NULL;
 		struct object_id *right_oid_ptr = NULL;
 		int ret = 0;
+		struct strbuf gitdir_buf = STRBUF_INIT;
 
-		/* Initialize repository */
-		repo = xmalloc(sizeof(*repo));
-		if (repo_init(repo, NULL, NULL) < 0) {
-			fprintf(stderr, "Failed to initialize repository\n");
-			free(repo);
+		/* Find .git directory - check if .git exists in current directory */
+		if (access(".git", F_OK) == 0) {
+			char cwd[PATH_MAX];
+			if (!getcwd(cwd, sizeof(cwd))) {
+				fprintf(stderr, "Failed to get current directory\n");
+				return 1;
+			}
+			strbuf_addstr(&gitdir_buf, cwd);
+			strbuf_addstr(&gitdir_buf, "/.git");
+			
+			if (repo_init(the_repository, gitdir_buf.buf, cwd) < 0) {
+				fprintf(stderr, "Failed to initialize repository at %s\n", gitdir_buf.buf);
+				strbuf_release(&gitdir_buf);
+				return 1;
+			}
+		} else {
+			fprintf(stderr, "Not in a git repository\n");
 			return 1;
 		}
 
@@ -248,7 +263,7 @@ int main(int argc, char **argv)
 		const char *right_str = argv[4];
 
 		if (strlen(base_str) > 0) {
-			if (repo_get_oid(repo, base_str, &base_oid) < 0) {
+			if (repo_get_oid(the_repository, base_str, &base_oid) < 0) {
 				fprintf(stderr, "Failed to parse base OID: %s\n", base_str);
 				ret = 1;
 				goto cleanup;
@@ -257,7 +272,7 @@ int main(int argc, char **argv)
 		}
 
 		if (strlen(left_str) > 0) {
-			if (repo_get_oid(repo, left_str, &left_oid) < 0) {
+			if (repo_get_oid(the_repository, left_str, &left_oid) < 0) {
 				fprintf(stderr, "Failed to parse left OID: %s\n", left_str);
 				ret = 1;
 				goto cleanup;
@@ -266,7 +281,7 @@ int main(int argc, char **argv)
 		}
 
 		if (strlen(right_str) > 0) {
-			if (repo_get_oid(repo, right_str, &right_oid) < 0) {
+			if (repo_get_oid(the_repository, right_str, &right_oid) < 0) {
 				fprintf(stderr, "Failed to parse right OID: %s\n", right_str);
 				ret = 1;
 				goto cleanup;
@@ -276,7 +291,7 @@ int main(int argc, char **argv)
 
 		/* Reconcile commits */
 		struct state_reconcile_result *result = reconcile_state_commits(
-			repo, base_oid_ptr, left_oid_ptr, right_oid_ptr);
+			the_repository, base_oid_ptr, left_oid_ptr, right_oid_ptr);
 
 		if (!result) {
 			fprintf(stderr, "Reconciliation failed\n");
@@ -291,8 +306,8 @@ int main(int argc, char **argv)
 		free_state_reconcile_result(result);
 
 cleanup:
-		repo_clear(repo);
-		free(repo);
+		strbuf_release(&gitdir_buf);
+		repo_clear(the_repository);
 		return ret;
 	}
 
