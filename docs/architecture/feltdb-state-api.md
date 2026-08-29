@@ -169,6 +169,18 @@ pub fn commit(&mut self, state: &Value, expected_parent: StateId)
 - Persists revision
 - Advances current pointer only on success
 
+**Create Branch Without Changing Current Pointer:**
+```rust
+pub fn create_branch(&mut self, parent: StateId, next_state: &Value) 
+  -> Result<StateHandle, StateStoreError>
+```
+- Validates parent exists
+- Canonicalizes state
+- Creates child revision from arbitrary parent
+- Persists revision
+- **Does NOT advance current pointer** (key distinction from commit)
+- Enables independent divergent histories to coexist
+
 **Reading Current State:**
 ```rust
 pub fn current(&self) -> Result<StateHandle, StateStoreError>
@@ -429,11 +441,20 @@ assert_eq!(current.state, child_state);
 - `test_state_store_parent`: Parent chain traversal
 - `test_state_store_parent_chain`: Multi-step chains
 - `test_state_store_multiple_branches_same_parent`: Branching
+- `test_state_store_create_branch_basic`: Explicit branching primitive
+- `test_state_store_create_branch_multiple_from_same_parent`: Multiple branches
+- `test_state_store_create_branch_preserves_current_pointer`: Current pointer isolation
+- `test_state_store_create_branch_retrieval`: Branch retrieval
+- `test_state_store_create_branch_chain`: Branch chaining
+- `test_state_store_create_branch_invalid_parent`: Error handling
+- `test_state_store_create_branch_vs_commit_difference`: Semantics comparison
+- `test_state_store_create_branch_metadata`: Metadata correctness
+- `test_state_store_create_branch_persists_and_recovers`: Persistence
 - `test_state_store_restart_recovers_state`: Persistence across restart
 - `test_state_store_git_independent`: Git independence
-- 7 more tests covering error paths and immutability
+- 3 more tests covering error paths and immutability
 
-**Total: 17 executable tests, all passing**
+**Total: 43 executable tests in StateStore (9 new tests for create_branch), all passing**
 
 ---
 
@@ -458,6 +479,15 @@ assert_eq!(current.state, child_state);
 | StateStore works without Git | test_state_store_git_independent | ✓ PROVEN |
 | Same content produces same StateId | test_state_store_same_content_produces_same_state_id | ✓ PROVEN |
 | Immutability of read operations | test_state_store_immutability_read_doesnt_mutate | ✓ PROVEN |
+| Explicit branch creation works | test_create_branch_basic | ✓ PROVEN |
+| Multiple independent branches from same parent | test_create_branch_multiple_from_same_parent | ✓ PROVEN |
+| Branch creation preserves current pointer | test_create_branch_preserves_current_pointer | ✓ PROVEN |
+| Created branches are retrievable | test_create_branch_retrieval | ✓ PROVEN |
+| Branch chains can be created | test_create_branch_chain | ✓ PROVEN |
+| Invalid branch parent is rejected | test_create_branch_invalid_parent | ✓ PROVEN |
+| Branch semantics differ from commit | test_create_branch_vs_commit_difference | ✓ PROVEN |
+| Branch metadata is correct | test_create_branch_metadata | ✓ PROVEN |
+| Branches persist and recover | test_create_branch_persists_and_recovers | ✓ PROVEN |
 
 ---
 
@@ -502,10 +532,35 @@ It only knows about:
 
 ## What Comes Next
 
-PR #7 establishes the foundation. Future architectural decisions:
+PR #7 establishes the foundation for state management. PR #9 adds explicit branching primitives.
 
-### PR #8 Options
-1. **Branching/Reconciliation**: Merge semantics for convergent histories
+### PR #9: State Branching & Divergence Primitives (IMPLEMENTED)
+✓ **create_branch()**: Creates revisions from arbitrary parent without changing current pointer
+✓ **Multiple divergent histories**: Same parent can have multiple independent children
+✓ **Causal relationship exposure**: Parent-child relationships are explicit and immutable
+✓ **Divergence identification**: Different branches are distinguishable without merge logic
+✓ **Current pointer isolation**: Branching operations do not affect application position
+
+**Scope (Deliberately Narrow):**
+- No automatic merging
+- No conflict resolution policy
+- No replication
+- No CRDTs
+- No consensus mechanisms
+
+**Tests (9 new):**
+- test_create_branch_basic
+- test_create_branch_multiple_from_same_parent
+- test_create_branch_preserves_current_pointer
+- test_create_branch_retrieval
+- test_create_branch_chain
+- test_create_branch_invalid_parent
+- test_create_branch_vs_commit_difference
+- test_create_branch_metadata
+- test_create_branch_persists_and_recovers
+
+### Future Options (PR #10+)
+1. **Merge/Reconciliation**: Semantics for converging divergent histories
 2. **Query Model**: Search and filter revisions efficiently
 3. **Incremental State**: Diff-based storage and retrieval
 
