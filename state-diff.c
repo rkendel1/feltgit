@@ -1,6 +1,8 @@
 #include "state-diff.h"
 #include "git-compat-util.h"
 #include "object.h"
+#include "commit.h"
+#include "odb.h"
 #include "strbuf.h"
 #include <string.h>
 #include <stdlib.h>
@@ -467,6 +469,12 @@ static int objects_equal(const struct state_object *a, const struct state_object
 
 static int values_equal(const struct state_value *a, const struct state_value *b)
 {
+	/* Handle NULL pointers */
+	if (a == NULL && b == NULL)
+		return 1;
+	if (a == NULL || b == NULL)
+		return 0;
+
 	if (a->type != b->type)
 		return 0;
 
@@ -717,8 +725,8 @@ static struct state_value *copy_state_value_recursive(const struct state_value *
 		struct state_object *obj_copy = xmalloc(sizeof(*obj_copy));
 		obj_copy->count = obj->count;
 		obj_copy->capacity = obj->count > 0 ? obj->count : 10;
-		obj_copy->keys = xmalloc(sizeof(char *) * obj_copy->capacity);
-		obj_copy->values = xmalloc(sizeof(struct state_value) * obj_copy->capacity);
+		obj_copy->keys = xcalloc(obj_copy->capacity, sizeof(char *));
+		obj_copy->values = xcalloc(obj_copy->capacity, sizeof(struct state_value));
 
 		for (size_t i = 0; i < obj->count; i++) {
 			obj_copy->keys[i] = xstrdup(obj->keys[i]);
@@ -892,9 +900,12 @@ static int set_value_at_path(struct state_object *root, const char *path,
 			if (!found) {
 				/* Add new key */
 				if (current->count >= current->capacity) {
+					size_t old_capacity = current->capacity;
 					current->capacity = current->capacity > 0 ? current->capacity * 2 : 10;
 					current->keys = xrealloc(current->keys, sizeof(char *) * current->capacity);
 					current->values = xrealloc(current->values, sizeof(struct state_value) * current->capacity);
+					/* Zero-initialize newly allocated values */
+					memset(&current->values[old_capacity], 0, sizeof(struct state_value) * (current->capacity - old_capacity));
 				}
 				current->keys[current->count] = xstrdup(component);
 				current->values[current->count] = *copy_state_value(value);
@@ -916,16 +927,19 @@ static int set_value_at_path(struct state_object *root, const char *path,
 			if (!found) {
 				/* Create new object */
 				if (current->count >= current->capacity) {
+					size_t old_capacity = current->capacity;
 					current->capacity = current->capacity > 0 ? current->capacity * 2 : 10;
 					current->keys = xrealloc(current->keys, sizeof(char *) * current->capacity);
 					current->values = xrealloc(current->values, sizeof(struct state_value) * current->capacity);
+					/* Zero-initialize newly allocated values */
+					memset(&current->values[old_capacity], 0, sizeof(struct state_value) * (current->capacity - old_capacity));
 				}
 
 				struct state_object *new_obj = xmalloc(sizeof(*new_obj));
 				new_obj->count = 0;
 				new_obj->capacity = 10;
-				new_obj->keys = xmalloc(sizeof(char *) * new_obj->capacity);
-				new_obj->values = xmalloc(sizeof(struct state_value) * new_obj->capacity);
+				new_obj->keys = xcalloc(new_obj->capacity, sizeof(char *));
+				new_obj->values = xcalloc(new_obj->capacity, sizeof(struct state_value));
 
 				current->keys[current->count] = xstrdup(component);
 				current->values[current->count].type = STATE_VALUE_OBJECT;
@@ -1039,8 +1053,8 @@ struct state_reconcile_result *reconcile_states(struct state_obj *base,
 		merged_obj->root = xmalloc(sizeof(struct state_object));
 		merged_obj->root->count = 0;
 		merged_obj->root->capacity = all_paths_count > 0 ? all_paths_count : 10;
-		merged_obj->root->keys = xmalloc(sizeof(char *) * merged_obj->root->capacity);
-		merged_obj->root->values = xmalloc(sizeof(struct state_value) * merged_obj->root->capacity);
+		merged_obj->root->keys = xcalloc(merged_obj->root->capacity, sizeof(char *));
+		merged_obj->root->values = xcalloc(merged_obj->root->capacity, sizeof(struct state_value));
 	}
 
 	/* Reconcile each path */
@@ -1176,4 +1190,221 @@ void free_state_conflicts(struct state_conflicts *conflicts)
 	}
 	free(conflicts->items);
 	free(conflicts);
+}
+
+struct state_reconcile_result *reconcile_state_commits(
+	struct repository *repo,
+	const struct object_id *base_oid,
+	const struct object_id *left_oid,
+	const struct object_id *right_oid)
+{
+	struct state_reconcile_result *result = NULL;
+	struct commit *base_commit = NULL;
+	struct commit *left_commit = NULL;
+	struct commit *right_commit = NULL;
+	struct state_obj *base_state = NULL;
+	struct state_obj *left_state = NULL;
+	struct state_obj *right_state = NULL;
+	const struct object_id *base_state_oid = NULL;
+	const struct object_id *left_state_oid = NULL;
+	const struct object_id *right_state_oid = NULL;
+	enum object_type type;
+	void *data = NULL;
+	size_t size;
+
+	CALLOC_ARRAY(result, 1);
+
+	/* Look up and validate commits */
+	if (base_oid) {
+		base_commit = lookup_commit(repo, base_oid);
+		if (!base_commit) {
+			/* Commit not found - return as tree commit error */
+			struct state_conflicts *conflicts = NULL;
+			CALLOC_ARRAY(conflicts, 1);
+			CALLOC_ARRAY(conflicts->items, 1);
+			conflicts->items[0].path = xstrdup("TREE_COMMIT");
+			conflicts->count = 1;
+			result->conflicts = conflicts;
+			result->success = 0;
+			return result;
+		}
+		
+		repo_parse_commit(repo, base_commit);
+		if (!base_commit->is_state_commit) {
+			/* Tree-root commit detected */
+			struct state_conflicts *conflicts = NULL;
+			CALLOC_ARRAY(conflicts, 1);
+			CALLOC_ARRAY(conflicts->items, 1);
+			conflicts->items[0].path = xstrdup("TREE_COMMIT");
+			conflicts->count = 1;
+			result->conflicts = conflicts;
+			result->success = 0;
+			return result;
+		}
+		base_state_oid = get_commit_state_oid(base_commit);
+	}
+
+	if (left_oid) {
+		left_commit = lookup_commit(repo, left_oid);
+		if (!left_commit) {
+			struct state_conflicts *conflicts = NULL;
+			CALLOC_ARRAY(conflicts, 1);
+			CALLOC_ARRAY(conflicts->items, 1);
+			conflicts->items[0].path = xstrdup("TREE_COMMIT");
+			conflicts->count = 1;
+			result->conflicts = conflicts;
+			result->success = 0;
+			return result;
+		}
+		
+		repo_parse_commit(repo, left_commit);
+		if (!left_commit->is_state_commit) {
+			struct state_conflicts *conflicts = NULL;
+			CALLOC_ARRAY(conflicts, 1);
+			CALLOC_ARRAY(conflicts->items, 1);
+			conflicts->items[0].path = xstrdup("TREE_COMMIT");
+			conflicts->count = 1;
+			result->conflicts = conflicts;
+			result->success = 0;
+			return result;
+		}
+		left_state_oid = get_commit_state_oid(left_commit);
+	}
+
+	if (right_oid) {
+		right_commit = lookup_commit(repo, right_oid);
+		if (!right_commit) {
+			struct state_conflicts *conflicts = NULL;
+			CALLOC_ARRAY(conflicts, 1);
+			CALLOC_ARRAY(conflicts->items, 1);
+			conflicts->items[0].path = xstrdup("TREE_COMMIT");
+			conflicts->count = 1;
+			result->conflicts = conflicts;
+			result->success = 0;
+			return result;
+		}
+		
+		repo_parse_commit(repo, right_commit);
+		if (!right_commit->is_state_commit) {
+			struct state_conflicts *conflicts = NULL;
+			CALLOC_ARRAY(conflicts, 1);
+			CALLOC_ARRAY(conflicts->items, 1);
+			conflicts->items[0].path = xstrdup("TREE_COMMIT");
+			conflicts->count = 1;
+			result->conflicts = conflicts;
+			result->success = 0;
+			return result;
+		}
+		right_state_oid = get_commit_state_oid(right_commit);
+	}
+
+	/* Load and parse state blobs */
+	if (base_state_oid) {
+		data = odb_read_object(repo->objects, base_state_oid, &type, &size);
+		if (!data || type != OBJ_BLOB) {
+			struct state_conflicts *conflicts = NULL;
+			CALLOC_ARRAY(conflicts, 1);
+			CALLOC_ARRAY(conflicts->items, 1);
+			conflicts->items[0].path = xstrdup("MISSING_STATE");
+			conflicts->count = 1;
+			result->conflicts = conflicts;
+			result->success = 0;
+			free(data);
+			return result;
+		}
+		base_state = parse_state_blob(data, size);
+		free(data);
+		if (!base_state) {
+			struct state_conflicts *conflicts = NULL;
+			CALLOC_ARRAY(conflicts, 1);
+			CALLOC_ARRAY(conflicts->items, 1);
+			conflicts->items[0].path = xstrdup("BAD_STATE");
+			conflicts->count = 1;
+			result->conflicts = conflicts;
+			result->success = 0;
+			return result;
+		}
+	}
+
+	if (left_state_oid) {
+		data = odb_read_object(repo->objects, left_state_oid, &type, &size);
+		if (!data || type != OBJ_BLOB) {
+			struct state_conflicts *conflicts = NULL;
+			CALLOC_ARRAY(conflicts, 1);
+			CALLOC_ARRAY(conflicts->items, 1);
+			conflicts->items[0].path = xstrdup("MISSING_STATE");
+			conflicts->count = 1;
+			result->conflicts = conflicts;
+			result->success = 0;
+			free(data);
+			if (base_state)
+				free_state_obj(base_state);
+			return result;
+		}
+		left_state = parse_state_blob(data, size);
+		free(data);
+		if (!left_state) {
+			struct state_conflicts *conflicts = NULL;
+			CALLOC_ARRAY(conflicts, 1);
+			CALLOC_ARRAY(conflicts->items, 1);
+			conflicts->items[0].path = xstrdup("BAD_STATE");
+			conflicts->count = 1;
+			result->conflicts = conflicts;
+			result->success = 0;
+			if (base_state)
+				free_state_obj(base_state);
+			return result;
+		}
+	}
+
+	if (right_state_oid) {
+		data = odb_read_object(repo->objects, right_state_oid, &type, &size);
+		if (!data || type != OBJ_BLOB) {
+			struct state_conflicts *conflicts = NULL;
+			CALLOC_ARRAY(conflicts, 1);
+			CALLOC_ARRAY(conflicts->items, 1);
+			conflicts->items[0].path = xstrdup("MISSING_STATE");
+			conflicts->count = 1;
+			result->conflicts = conflicts;
+			result->success = 0;
+			free(data);
+			if (base_state)
+				free_state_obj(base_state);
+			if (left_state)
+				free_state_obj(left_state);
+			return result;
+		}
+		right_state = parse_state_blob(data, size);
+		free(data);
+		if (!right_state) {
+			struct state_conflicts *conflicts = NULL;
+			CALLOC_ARRAY(conflicts, 1);
+			CALLOC_ARRAY(conflicts->items, 1);
+			conflicts->items[0].path = xstrdup("BAD_STATE");
+			conflicts->count = 1;
+			result->conflicts = conflicts;
+			result->success = 0;
+			if (base_state)
+				free_state_obj(base_state);
+			if (left_state)
+				free_state_obj(left_state);
+			return result;
+		}
+	}
+
+	/* Call the semantic reconciliation engine */
+	struct state_reconcile_result *reconcile_result = 
+		reconcile_states(base_state, left_state, right_state);
+
+	/* Free parsed states */
+	if (base_state)
+		free_state_obj(base_state);
+	if (left_state)
+		free_state_obj(left_state);
+	if (right_state)
+		free_state_obj(right_state);
+
+	/* Copy result and free temporary */
+	free(result);
+	return reconcile_result;
 }

@@ -196,4 +196,37 @@ void free_state_reconcile_result(struct state_reconcile_result *result);
  */
 void free_state_conflicts(struct state_conflicts *conflicts);
 
+/*
+ * Commit-level three-way reconciliation wrapper.
+ *
+ * Given three commit OIDs (base, left, right), performs three-way reconciliation
+ * at the commit level by:
+ * 1. Looking up each commit in the repository
+ * 2. Validating that all three are state-root commits (not tree commits)
+ * 3. Extracting the state OIDs from each commit
+ * 4. Loading and parsing the state blobs
+ * 5. Calling reconcile_states() on the parsed states
+ *
+ * Arguments:
+ *   repo: Repository context for object lookup
+ *   base_oid: OID of base commit (may be NULL)
+ *   left_oid: OID of left commit (may be NULL)
+ *   right_oid: OID of right commit (may be NULL)
+ *
+ * Returns:
+ *   struct state_reconcile_result with merged_state (success=1) or conflicts (success=0)
+ *   NULL if any commit is a tree-root commit or other validation error
+ *
+ * Caller must free result with free_state_reconcile_result().
+ *
+ * Errors returned in result->success = 0 with conflicts array describing the issue:
+ *   - "TREE_COMMIT" in path field indicates a tree-root commit was provided
+ *   - Object read errors or parsing errors fail the operation
+ */
+struct state_reconcile_result *reconcile_state_commits(
+	struct repository *repo,
+	const struct object_id *base_oid,
+	const struct object_id *left_oid,
+	const struct object_id *right_oid);
+
 #endif

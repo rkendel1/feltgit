@@ -484,6 +484,148 @@ test_expect_success 'Merged state has canonical key ordering' '
 '
 
 ################################################################################
+# COMMIT-LEVEL RECONCILIATION (PR #5)
+################################################################################
+
+# Helper: Create a state commit
+create_state_commit() {
+	local json_content="$1"
+	local commit_msg="$2"
+	
+	# Create a blob with the state content
+	local state_blob=$(echo "$json_content" | git hash-object -w --stdin)
+	
+	# Create a commit object with state root
+	local commit_text="state $state_blob
+author Test <test@example.com> 1234567890 +0000
+committer Test <test@example.com> 1234567890 +0000
+
+$commit_msg"
+	
+	# Create the commit object
+	local commit=$(echo "$commit_text" | git hash-object -w -t commit --stdin)
+	echo "$commit"
+}
+
+# Helper: Test commit-level reconciliation
+reconcile_commits() {
+	local base_oid="$1"
+	local left_oid="$2"
+	local right_oid="$3"
+	git-state-reconcile-test reconcile-commits "$base_oid" "$left_oid" "$right_oid"
+}
+
+# Helper: Assert successful commit reconciliation
+assert_commit_success() {
+	local result="$1"
+	local test_name="$2"
+	
+	local success=$(echo "$result" | sed 's/.*"success":\([01]\).*/\1/')
+	local conflicts=$(echo "$result" | sed 's/.*"conflicts":\([0-9]*\).*/\1/')
+	
+	test "$success" = "1" || {
+		echo "Expected successful merge, got: $result" >&2
+		return 1
+	}
+	test "$conflicts" = "0" || {
+		echo "Expected 0 conflicts, got $conflicts" >&2
+		return 1
+	}
+}
+
+# Helper: Assert commit reconciliation produces conflicts
+assert_commit_conflicts() {
+	local result="$1"
+	local expected_count="$2"
+	local test_name="$3"
+	
+	local success=$(echo "$result" | sed 's/.*"success":\([01]\).*/\1/')
+	local conflicts=$(echo "$result" | sed 's/.*"conflicts":\([0-9]*\).*/\1/')
+	
+	test "$success" = "0" || {
+		echo "Expected conflict, got success" >&2
+		return 1
+	}
+	test "$conflicts" = "$expected_count" || {
+		echo "Expected $expected_count conflicts, got $conflicts" >&2
+		return 1
+	}
+}
+
+test_expect_success 'Commit-level: Create state commits' '
+	test_commit --no-tag "Setup" setup setup &&
+	
+	# Create base state commit
+	base_commit=$(create_state_commit "{\"name\":\"Base\"}" "Base state") &&
+	
+	# Create left state commit (changed name)
+	left_commit=$(create_state_commit "{\"name\":\"Left\"}" "Left state") &&
+	
+	# Create right state commit (unchanged)
+	right_commit=$(create_state_commit "{\"name\":\"Base\"}" "Right state") &&
+	
+	# Verify commits were created
+	test -n "$base_commit" &&
+	test -n "$left_commit" &&
+	test -n "$right_commit"
+'
+
+test_expect_success 'Commit-level: Reconcile three state commits - left only changed' '
+	# Create commits
+	base_commit=$(create_state_commit "{\"role\":\"user\"}" "Base") &&
+	left_commit=$(create_state_commit "{\"role\":\"admin\"}" "Left") &&
+	right_commit=$(create_state_commit "{\"role\":\"user\"}" "Right") &&
+	
+	# Reconcile commits
+	result=$(reconcile_commits "$base_commit" "$left_commit" "$right_commit") &&
+	assert_commit_success "$result"
+'
+
+test_expect_success 'Commit-level: Reconcile three state commits - right only changed' '
+	# Create commits with right changing
+	base_commit=$(create_state_commit "{\"role\":\"user\"}" "Base") &&
+	left_commit=$(create_state_commit "{\"role\":\"user\"}" "Left") &&
+	right_commit=$(create_state_commit "{\"role\":\"admin\"}" "Right") &&
+	
+	# Reconcile commits
+	result=$(reconcile_commits "$base_commit" "$left_commit" "$right_commit") &&
+	assert_commit_success "$result"
+'
+
+test_expect_success 'Commit-level: Reconcile state commits - identical changes' '
+	# Both sides change to same value
+	base_commit=$(create_state_commit "{\"role\":\"user\"}" "Base") &&
+	left_commit=$(create_state_commit "{\"role\":\"admin\"}" "Left") &&
+	right_commit=$(create_state_commit "{\"role\":\"admin\"}" "Right") &&
+	
+	# Reconcile commits
+	result=$(reconcile_commits "$base_commit" "$left_commit" "$right_commit") &&
+	assert_commit_success "$result"
+'
+
+test_expect_success 'Commit-level: Reconcile state commits - conflicting changes' '
+	# Both sides change to different values
+	base_commit=$(create_state_commit "{\"role\":\"user\"}" "Base") &&
+	left_commit=$(create_state_commit "{\"role\":\"admin\"}" "Left") &&
+	right_commit=$(create_state_commit "{\"role\":\"superuser\"}" "Right") &&
+	
+	# Reconcile commits - should produce conflict
+	result=$(reconcile_commits "$base_commit" "$left_commit" "$right_commit") &&
+	assert_commit_conflicts "$result" 1
+'
+
+test_expect_success 'Commit-level: Nested object reconciliation in commits' '
+	# Test with nested changes
+	base_commit=$(create_state_commit "{\"user\":{\"name\":\"Base\",\"role\":\"user\"}}" "Base") &&
+	left_commit=$(create_state_commit "{\"user\":{\"name\":\"Base\",\"role\":\"admin\"}}" "Left") &&
+	right_commit=$(create_state_commit "{\"user\":{\"name\":\"Changed\",\"role\":\"user\"}}" "Right") &&
+	
+	# Reconcile commits - independent nested changes should succeed
+	result=$(reconcile_commits "$base_commit" "$left_commit" "$right_commit") &&
+	assert_commit_success "$result"
+'
+
+################################################################################
 # CLEANUP
 ################################################################################
 
