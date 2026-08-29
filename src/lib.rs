@@ -1,4 +1,5 @@
 pub mod state_history;
+pub mod state_store;
 
 #[cfg(feature = "git-integration")]
 pub mod csum_file;
