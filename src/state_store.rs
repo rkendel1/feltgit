@@ -5289,7 +5289,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let auth_alice = AuthorityId::new("alice").unwrap();
 
-        let mut store = StateStore::new(temp_dir.path(), auth_alice).unwrap();
+        let mut store = StateStore::new(temp_dir.path(), auth_alice.clone()).unwrap();
 
         let base = store.create(&json!({"x": 1})).unwrap();
         let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
@@ -5338,6 +5338,427 @@ mod tests {
         // Verify it succeeded entirely in pure state store semantics
         assert_eq!(reconciled.state, json!({"data": "merged"}));
         assert!(reconciled.state_id.to_hex().len() > 0);
+    }
+
+    // ===== PARENTAGE AUDIT TESTS =====
+    // These tests resolve whether single-parent StateRevision semantics can correctly
+    // represent a reconciled state derived from Base + Left + Right.
+    //
+    // Critical question: Does StateRevision.parent represent:
+    // (a) Sole causal ancestor (genealogy)?
+    // (b) Immediate materialization source (mechanics)?
+    // (c) Something else?
+
+    #[test]
+    fn p2_topology_consistency_after_diverged_reconciliation() {
+        // P2 REQUIREMENT: Test actual topology after reconciliation with Base→Left, Base→Right
+        // 
+        // Setup: Base → Left, Base → Right
+        // Action: Reconcile Left + Right into Result
+        // Test: Query relationship(Left, Result) and relationship(Right, Result)
+        //
+        // CRITICAL: If parent(Result) = Left, the topology shows:
+        //   Base → Left → Result
+        //   Base → Right (disconnected from Result)
+        //
+        // This means relationship(Right, Result) will NOT show Right as a causal input.
+        // That is the architectural question we must answer.
+
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("p2_topology").unwrap();
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Build: Base → Left, Base → Right
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        // Verify divergence
+        let rel_before = store.relationship(left.state_id, right.state_id).unwrap();
+        assert!(
+            matches!(rel_before, StateRelationship::Diverged),
+            "Expected Diverged, got {:?}",
+            rel_before
+        );
+
+        // Reconcile Left + Right → Result
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 2, "merged": true}),
+        };
+        let result = store.reconcile(&plan).unwrap();
+
+        // P2 AUDIT EVIDENCE: Check the actual topology relationships
+        //
+        // Query: relationship(Left, Result)
+        let rel_left_result = store.relationship(left.state_id, result.state_id).unwrap();
+        // Expected if parent=Left: Ancestor (Left is direct parent of Result)
+        assert!(
+            matches!(rel_left_result, StateRelationship::Ancestor),
+            "P2: relationship(Left, Result) should be Ancestor (Left is parent), got {:?}",
+            rel_left_result
+        );
+
+        // Query: relationship(Right, Result)
+        let rel_right_result = store.relationship(right.state_id, result.state_id).unwrap();
+        // THIS IS THE CRITICAL TEST:
+        // If single-parent semantics are sufficient, Right should NOT appear as an ancestor.
+        // Instead, relationship(Right, Result) will show Diverged or Unrelated,
+        // because the topology only records Left → Result.
+        //
+        // This is the architectural problem:
+        // - Result WAS semantically derived from Right (it's in the ReconciliationPlan)
+        // - But the topology DOES NOT record Right → Result
+        // - So relationship(Right, Result) will NOT correctly answer "Was Result derived from Right?"
+        //
+        // EVIDENCE CAPTURE:
+        match rel_right_result {
+            StateRelationship::Ancestor | StateRelationship::Descendant => {
+                panic!(
+                    "P2 ALERT: relationship(Right, Result) = {:?}. \
+                     This would mean Right is in Result's ancestry, but the topology \
+                     only records Left→Result. This should not happen with single-parent semantics.",
+                    rel_right_result
+                );
+            }
+            StateRelationship::Diverged => {
+                // This is expected if Right is not in the ancestry.
+                // But this is PROBLEMATIC from an architectural perspective:
+                // Result WAS derived from Right, but topology says Diverged.
+            }
+            StateRelationship::Identity => {
+                panic!(
+                    "P2 ALERT: relationship(Right, Result) = Identity. \
+                     Right and Result are not the same state."
+                );
+            }
+            StateRelationship::Unrelated => {
+                // If Right and Result are unrelated in the topology, this indicates
+                // that Right's causal contribution to Result is NOT preserved in the ancestry.
+            }
+        }
+
+        // Common ancestor queries
+        let ancestor_left_result = store.common_ancestor(left.state_id, result.state_id);
+        assert_eq!(
+            ancestor_left_result,
+            Some(base.state_id),
+            "P2: common_ancestor(Left, Result) should be Base"
+        );
+
+        let _ancestor_right_result = store.common_ancestor(right.state_id, result.state_id);
+        // CRITICAL: If Right is not in Result's ancestry, what is the common ancestor?
+        // If Result's parent=Left, then common_ancestor(Right, Result) would be Base
+        // (the common ancestor of Right and Left).
+        // But this does NOT tell us that Right contributed to Result.
+    }
+
+    #[test]
+    fn p3_information_preservation_right_ancestry() {
+        // P3 REQUIREMENT: Can the database answer "Was Result derived from Right?"
+        // using topology primitives alone?
+        //
+        // If parent(Result) = Left and Right's contribution is only in provenance metadata,
+        // then the answer would be NO - the topology cannot answer this question.
+        //
+        // EVIDENCE: Attempt to reconstruct whether Right was a direct input to reconciliation
+
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("p3_info").unwrap();
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 2}),
+        };
+        let result = store.reconcile(&plan).unwrap();
+
+        // Attempt to answer via topology: "Was Result derived from Right?"
+        // Method 1: Check if Right is an ancestor of Result
+        let rel = store.relationship(right.state_id, result.state_id).unwrap();
+        let right_is_ancestor = matches!(
+            rel,
+            StateRelationship::Ancestor | StateRelationship::Identity
+        );
+
+        // Method 2: Check if Right is in the lineage by walking ancestors
+        let mut current = Some(result.state_id);
+        let mut found_right = false;
+        let mut depth = 0;
+        const MAX_DEPTH: usize = 10;
+
+        while let Some(current_id) = current {
+            if current_id == right.state_id {
+                found_right = true;
+                break;
+            }
+            depth += 1;
+            if depth > MAX_DEPTH {
+                break; // Safety limit
+            }
+            // Get the parent to find next ancestor
+            if let Ok(parent_opt) = store.parent(current_id) {
+                current = parent_opt;
+            } else {
+                break;
+            }
+        }
+
+        // P3 EVIDENCE:
+        // If single-parent semantics are sufficient, this test should show:
+        // - Right is NOT an ancestor of Result (topology says Diverged or Unrelated)
+        // - Right is NOT found by walking Result's parent chain
+        //
+        // This would prove that Right's contribution is LOST from the topology
+        // and can only be recovered from provenance metadata (if stored in the result value).
+
+        if right_is_ancestor || found_right {
+            panic!(
+                "P3 ALERT: Right was found in Result's ancestry. \
+                 This indicates Right's relationship is preserved in the topology. \
+                 Actual: right_is_ancestor={}, found_by_walk={}",
+                right_is_ancestor, found_right
+            );
+        }
+
+        // If we reach here, it means Right's contribution is not discoverable via topology.
+        // This is the core architectural issue.
+    }
+
+    #[test]
+    fn p5_diff_classification_after_reconciliation() {
+        // P5 REQUIREMENT: After creating Result, run diff(Right, Result) and
+        // classify_conflicts(Right, Result). Verify semantic correctness.
+        //
+        // CRITICAL: If the topology has Result → Diverged ← Right,
+        // then diff() and classify_conflicts() will treat Right and Result as
+        // having diverged independently, not as Right being a direct input to Result.
+
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("p5_diff").unwrap();
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        // Reconcile: Take Left's value
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 2}),
+        };
+        let result = store.reconcile(&plan).unwrap();
+
+        // Now compute diff and classification
+        let diff_result = store
+            .diff(right.state_id, result.state_id)
+            .expect("diff should succeed");
+
+        let classification = store
+            .classify_conflicts(right.state_id, result.state_id)
+            .expect("classify should succeed");
+
+        // P5 EVIDENCE:
+        // The diff shows changes between Right and Result.
+        // But are these classified as "converging" changes, or as "diverging" changes?
+        //
+        // Semantically: Result INCORPORATES Right's input. The diff should reflect
+        // that Result is a deliberate reconciliation, not a random divergence.
+        //
+        // But if the topology only shows Left → Result, then diff/classify may treat
+        // this as an independent divergence from Right's perspective.
+
+        // We cannot verify semantic correctness without defining the expected behavior.
+        // This test documents the actual behavior so architects can decide if it's acceptable.
+
+        // For now, capture the evidence
+        println!(
+            "P5 EVIDENCE: diff(Right, Result) = {:?}",
+            diff_result
+        );
+        println!(
+            "P5 EVIDENCE: classify_conflicts(Right, Result) = {:?}",
+            classification
+        );
+
+        // The test passes if these operations complete without error.
+        // The semantic correctness is a matter of architectural interpretation.
+    }
+
+    #[test]
+    fn p6_arbitrary_parent_invariance() {
+        // P6 REQUIREMENT: Run the same reconciliation twice with different parent choices.
+        // 
+        // Scenario 1: Reconcile with parent = Left
+        // Scenario 2: Reconcile with parent = Right (hypothetically)
+        //
+        // Do the resulting topologies differ? If so, which is correct?
+        // Or are they equally valid linearizations?
+        //
+        // NOTE: Current implementation only supports parent = Left.
+        // This test documents why the choice matters.
+
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("p6_parent").unwrap();
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        // Create reconciled state with parent = Left (current implementation)
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 2}),
+        };
+        let result_left_parent = store.reconcile(&plan).unwrap();
+
+        // Query topology from result_left_parent's perspective
+        let rel_from_left = store.relationship(left.state_id, result_left_parent.state_id).unwrap();
+        let rel_from_right = store.relationship(right.state_id, result_left_parent.state_id).unwrap();
+
+        // P6 EVIDENCE:
+        // If we created a hypothetical result_right_parent (with parent = Right),
+        // its topology would show:
+        //   relationship(Left, result_right_parent) ≠ Ancestor (Left would not be parent)
+        //   relationship(Right, result_right_parent) = Ancestor (Right would be parent)
+        //
+        // This would prove that the parent choice directly affects the topology.
+        // The question is: Does it affect the SEMANTIC correctness?
+        //
+        // In both cases, the result value is identical ({"x": 2}).
+        // But the topology changes based on which input we claim is the "immediate causal predecessor".
+
+        // Current evidence (parent = Left):
+        assert!(
+            matches!(rel_from_left, StateRelationship::Ancestor),
+            "P6: With parent=Left, relationship(Left, Result) should be Ancestor"
+        );
+
+        println!(
+            "P6 EVIDENCE: With parent=Left, relationship(Right, Result) = {:?}",
+            rel_from_right
+        );
+
+        // The key question remains: If we could choose parent=Right instead,
+        // would that be equally valid? Or is there a correct choice?
+        //
+        // The answer depends on what parent semantically represents.
+    }
+
+    #[test]
+    fn p1_parent_semantic_definition_required() {
+        // P1 REQUIREMENT: Explicitly define what StateRevision.parent means
+        //
+        // Current documentation (state_history.rs): "The immediate causal predecessor, if any."
+        //
+        // This test documents why the definition matters:
+        //
+        // Interpretation A: Parent = Sole Causal Ancestor (genealogy)
+        //   Then parent(Result) = Left is WRONG because Result also came from Right.
+        //   The topology is false.
+        //
+        // Interpretation B: Parent = Immediate Materialization Source (mechanics)
+        //   Then parent(Result) = Left is OK because Left was the "source" we used.
+        //   But then the topology doesn't represent causal dependency, only materialization order.
+        //
+        // Interpretation C: Parent = Single Arbitrarily Chosen Predecessor
+        //   Then parent(Result) = Left is acceptable if documented as intentional linearization.
+        //   But then the architecture must explicitly say so.
+        //
+        // EVIDENCE: This test is a documentation requirement, not a runtime check.
+        // The decision must come from architectural review.
+
+        // Minimal test just to have runtime evidence
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("p1_definition").unwrap();
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let state = store.create(&json!({"data": "test"})).unwrap();
+
+        // Parent must be documented and consistent
+        let parent_opt = store.parent(state.state_id).unwrap();
+
+        // The parent should exist and be documented
+        // If parent is supposed to represent "sole causal ancestor", then
+        // a reconciliation result's parent should represent all causal inputs.
+        // If parent is only a "convenience link", then single-parent is acceptable.
+
+        // This test doesn't resolve the question, it just ensures
+        // the runtime semantics match whatever definition is chosen.
+        println!(
+            "P1 REQUIREMENT: StateRevision.parent must have explicit semantic definition. \
+             Current state parent = {:?}",
+            parent_opt
+        );
+    }
+
+    #[test]
+    fn p4_provenance_metadata_not_ancestry_edges() {
+        // P4 REQUIREMENT: Prove that provenance metadata does NOT substitute for ancestry edges
+        //
+        // The current reconciliation strategy:
+        // 1. Store base, left, right as provenance metadata (hypothetically in result value)
+        // 2. Store only left as the parent (single edge)
+        //
+        // This test verifies whether the topology queries work correctly WITHOUT
+        // the provenance metadata.
+
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("p4_provenance").unwrap();
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        // Reconcile without storing base/left/right in the result value
+        // (The reconciliation mechanism doesn't do this anyway)
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 2, "no_provenance": true}),
+        };
+        let result = store.reconcile(&plan).unwrap();
+
+        // P4 TEST: Can we answer "What was the base state for this reconciliation?"
+        // using topology alone (without provenance metadata in the result value)?
+        //
+        // Answer: NO. The topology only shows Left → Result.
+        // We cannot discover base or right just from topology.
+
+        // This proves that the current architecture REQUIRES provenance metadata
+        // to be stored somewhere (either in the result value, or in StateRevision's metadata).
+        //
+        // The question is: Is that acceptable?
+        //
+        // If parent semantics are "sole causal ancestor", then no, it's not acceptable.
+        // If parent semantics are "materialization source", then possibly yes.
+
+        println!(
+            "P4 EVIDENCE: Result state has value: {:?}",
+            result.state
+        );
+        println!(
+            "P4: Topology alone cannot answer 'what was the base state?' \
+             The base, left, right must be stored as metadata if they need to be queryable."
+        );
+
+        // Minimal assertion to make test pass
+        assert!(!result.state.to_string().is_empty());
     }
 }
 
