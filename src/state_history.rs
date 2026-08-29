@@ -429,7 +429,8 @@ impl StateHistory {
     }
 
     /// Get all ancestors of a state, ordered from immediate parent to root.
-    /// Returns an empty vector if the state is not found or is a root (no parents).
+    /// Returns an error if the state is not found.
+    /// Returns an empty vector if the state is a root (has no parents).
     pub fn ancestors(&self, state_id: StateId) -> Result<Vec<StateId>, StateHistoryError> {
        let mut ancestors = Vec::new();
        let mut current = state_id;
