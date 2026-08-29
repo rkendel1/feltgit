@@ -3201,5 +3201,499 @@ mod tests {
             _ => panic!("Expected Changed change"),
         }
     }
+
+    // ============================================================
+    // EVIDENCE-FIRST HOSTILE AUDIT TESTS
+    // ============================================================
+    // These tests verify the deterministic semantic diff is correct,
+    // read-only, and handles all edge cases properly.
+    // ============================================================
+
+    #[test]
+    fn evidence_determinism_identical_output() {
+        // Verify: Multiple calls with same inputs produce identical results
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_determinism").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({
+            "z": 3,
+            "a": 1,
+            "m": 2,
+            "nested": {"y": 20, "x": 10}
+        })).unwrap();
+
+        let right = store.commit(&json!({
+            "z": 3,
+            "a": 2,
+            "m": 2,
+            "nested": {"x": 10, "y": 21},
+            "new": "field"
+        }), left.state_id).unwrap();
+
+        // Compute diff three times with identical inputs
+        let diff1 = store.diff(left.state_id, right.state_id).unwrap();
+        let diff2 = store.diff(left.state_id, right.state_id).unwrap();
+        let diff3 = store.diff(left.state_id, right.state_id).unwrap();
+
+        // All must be byte-identical
+        assert_eq!(diff1.changes.len(), diff2.changes.len(), "Length must be identical");
+        assert_eq!(diff2.changes.len(), diff3.changes.len(), "Length must be identical");
+
+        for (c1, c2) in diff1.changes.iter().zip(diff2.changes.iter()) {
+            assert_eq!(c1, c2, "Changes must be identical across invocations");
+        }
+
+        for (c2, c3) in diff2.changes.iter().zip(diff3.changes.iter()) {
+            assert_eq!(c2, c3, "Changes must be identical across invocations");
+        }
+    }
+
+    #[test]
+    fn evidence_readonly_no_file_mutations() {
+        // Verify: diff() does not create or modify files in storage
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_readonly").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let a = store.create(&json!({"x": 1})).unwrap();
+        let b = store.commit(&json!({"x": 2}), a.state_id).unwrap().state_id;
+
+        // Get initial file count
+        let initial_files: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .collect();
+        let initial_count = initial_files.len();
+
+        // Perform diff multiple times
+        for _ in 0..5 {
+            let _ = store.diff(a.state_id, b);
+        }
+
+        // Verify file count unchanged
+        let final_files: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .collect();
+        let final_count = final_files.len();
+
+        assert_eq!(initial_count, final_count, "diff() must not create files");
+    }
+
+    #[test]
+    fn evidence_change_type_correctness_added() {
+        // Verify: Added changes only appear when value is in right, not left
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_added").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({"existing": "value"})).unwrap();
+        let right = store.commit(&json!({"existing": "value", "new_field": 42}), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+        
+        // Should have exactly one Added change
+        let added_changes: Vec<_> = diff.changes.iter()
+            .filter_map(|c| if let StateChange::Added { path, value } = c {
+                Some((path.to_canonical_string(), value.clone()))
+            } else {
+                None
+            })
+            .collect();
+
+        assert_eq!(added_changes.len(), 1, "Should have one Added change");
+        assert_eq!(added_changes[0].0, "new_field");
+        assert_eq!(added_changes[0].1, json!(42));
+    }
+
+    #[test]
+    fn evidence_change_type_correctness_removed() {
+        // Verify: Removed changes only appear when value is in left, not right
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_removed").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({"existing": "value", "to_remove": true})).unwrap();
+        let right = store.commit(&json!({"existing": "value"}), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+        
+        // Should have exactly one Removed change
+        let removed_changes: Vec<_> = diff.changes.iter()
+            .filter_map(|c| if let StateChange::Removed { path, value } = c {
+                Some((path.to_canonical_string(), value.clone()))
+            } else {
+                None
+            })
+            .collect();
+
+        assert_eq!(removed_changes.len(), 1, "Should have one Removed change");
+        assert_eq!(removed_changes[0].0, "to_remove");
+        assert_eq!(removed_changes[0].1, json!(true));
+    }
+
+    #[test]
+    fn evidence_change_type_correctness_changed() {
+        // Verify: Changed changes reflect actual value differences
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_changed").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({"field": "old_value"})).unwrap();
+        let right = store.commit(&json!({"field": "new_value"}), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+        
+        // Should have exactly one Changed change
+        let changed_changes: Vec<_> = diff.changes.iter()
+            .filter_map(|c| if let StateChange::Changed { path, from, to } = c {
+                Some((path.to_canonical_string(), from.clone(), to.clone()))
+            } else {
+                None
+            })
+            .collect();
+
+        assert_eq!(changed_changes.len(), 1, "Should have one Changed change");
+        assert_eq!(changed_changes[0].0, "field");
+        assert_eq!(changed_changes[0].1, json!("old_value"));
+        assert_eq!(changed_changes[0].2, json!("new_value"));
+    }
+
+    #[test]
+    fn evidence_path_ordering_lexicographic() {
+        // Verify: Changes are ordered lexicographically by path
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_ordering").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Create a state with some structure
+        let left = store.create(&json!({
+            "zebra": 1,
+            "apple": {"x": 1},
+            "monkey": {"zebra": 1, "apple": 1}
+        })).unwrap();
+
+        // Modify multiple fields to create changes at different paths
+        let right = store.commit(&json!({
+            "zebra": 2,
+            "apple": {"x": 2, "y": 3},
+            "monkey": {"zebra": 2, "apple": 2}
+        }), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+
+        // Extract paths
+        let paths: Vec<String> = diff.changes.iter()
+            .map(|c| c.path().to_canonical_string())
+            .collect();
+
+        // Verify sorted
+        let mut sorted_paths = paths.clone();
+        sorted_paths.sort();
+
+        assert_eq!(paths, sorted_paths, "Changes must be ordered lexicographically");
+        // Expected: apple.y (added), apple.x (changed), monkey.apple (changed), monkey.zebra (changed), zebra (changed)
+        // But since we only have all Added and Changed here, order should be: apple.x, apple.y, monkey.apple, monkey.zebra, zebra
+        assert!(paths.len() > 0, "Should have changes");
+        
+        // Verify first < second < third, etc.
+        for i in 1..paths.len() {
+            assert!(paths[i-1] <= paths[i], "Paths {} and {} not in order", paths[i-1], paths[i]);
+        }
+    }
+
+    #[test]
+    fn evidence_deep_nesting_10_levels() {
+        // Verify: Works correctly with 10+ levels of nesting
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_deep").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Build deeply nested structure
+        let left = json!({
+            "l1": {
+                "l2": {
+                    "l3": {
+                        "l4": {
+                            "l5": {
+                                "l6": {
+                                    "l7": {
+                                        "l8": {
+                                            "l9": {
+                                                "l10": {
+                                                    "value": 1
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let right = json!({
+            "l1": {
+                "l2": {
+                    "l3": {
+                        "l4": {
+                            "l5": {
+                                "l6": {
+                                    "l7": {
+                                        "l8": {
+                                            "l9": {
+                                                "l10": {
+                                                    "value": 2
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let rev_left = store.create(&left).unwrap();
+        let rev_right = store.commit(&right, rev_left.state_id).unwrap();
+
+        let diff = store.diff(rev_left.state_id, rev_right.state_id).unwrap();
+        assert_eq!(diff.len(), 1);
+
+        match &diff.changes[0] {
+            StateChange::Changed { path, from, to } => {
+                assert_eq!(path.to_canonical_string(), "l1.l2.l3.l4.l5.l6.l7.l8.l9.l10.value");
+                assert_eq!(*from, json!(1));
+                assert_eq!(*to, json!(2));
+            }
+            _ => panic!("Expected Changed"),
+        }
+    }
+
+    #[test]
+    fn evidence_directionality_inverse() {
+        // Verify: diff(A,B) changes are proper inverse of diff(B,A)
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_direction").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({"a": 1, "b": 2})).unwrap();
+        let right = store.commit(&json!({"a": 10, "c": 3}), left.state_id).unwrap();
+
+        let diff_ab = store.diff(left.state_id, right.state_id).unwrap();
+        let diff_ba = store.diff(right.state_id, left.state_id).unwrap();
+
+        // Must have same number of changes
+        assert_eq!(diff_ab.len(), diff_ba.len(), "Diffs must have same length");
+
+        // Changes at same paths but inverted
+        for (change_ab, change_ba) in diff_ab.changes.iter().zip(diff_ba.changes.iter()) {
+            assert_eq!(change_ab.path(), change_ba.path(), "Paths must match");
+
+            match (change_ab, change_ba) {
+                (StateChange::Added { value: v1, .. }, StateChange::Removed { value: v2, .. }) => {
+                    assert_eq!(v1, v2, "Added/Removed values must match");
+                }
+                (StateChange::Removed { value: v1, .. }, StateChange::Added { value: v2, .. }) => {
+                    assert_eq!(v1, v2, "Removed/Added values must match");
+                }
+                (StateChange::Changed { from: f1, to: t1, .. }, StateChange::Changed { from: f2, to: t2, .. }) => {
+                    assert_eq!(f1, t2, "Changed must be inverted");
+                    assert_eq!(t1, f2, "Changed must be inverted");
+                }
+                _ => panic!("Unexpected change combination"),
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_large_array_1000_elements() {
+        // Verify: Handles large arrays efficiently
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_large_array").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Create array with 1000 elements
+        let mut items = Vec::new();
+        for i in 0..1000 {
+            items.push(json!(i));
+        }
+
+        let left = store.create(&json!({"items": items})).unwrap();
+
+        // Modify one element
+        let mut items2 = items.clone();
+        items2[500] = json!(99999);
+
+        let right = store.commit(&json!({"items": items2}), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+        
+        // Should detect only the one change
+        assert_eq!(diff.len(), 1);
+        match &diff.changes[0] {
+            StateChange::Changed { path, from, to } => {
+                assert_eq!(path.to_canonical_string(), "items[500]");
+                assert_eq!(*from, json!(500));
+                assert_eq!(*to, json!(99999));
+            }
+            _ => panic!("Expected Changed"),
+        }
+    }
+
+    #[test]
+    fn evidence_special_json_values() {
+        // Verify: Correctly handles special JSON values
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_special").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({
+            "null_value": null,
+            "false_value": false,
+            "zero_value": 0,
+            "empty_string": "",
+            "empty_array": [],
+            "empty_object": {}
+        })).unwrap();
+
+        // Change each special value
+        let right = store.commit(&json!({
+            "null_value": false,
+            "false_value": 0,
+            "zero_value": "",
+            "empty_string": [],
+            "empty_array": {},
+            "empty_object": null
+        }), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+
+        // Should have 6 changes, one per field
+        assert_eq!(diff.len(), 6, "All special values should produce changes");
+
+        // Verify all are Changed (not Added/Removed)
+        for change in &diff.changes {
+            match change {
+                StateChange::Changed { .. } => {}
+                _ => panic!("Special values should produce Changed, not {:?}", change),
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_mixed_array_object_nesting() {
+        // Verify: Correctly handles mixed array/object nesting
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_mixed").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({
+            "users": [
+                {"id": 1, "name": "Alice", "tags": ["admin"]},
+                {"id": 2, "name": "Bob", "tags": ["user"]}
+            ]
+        })).unwrap();
+
+        let right = store.commit(&json!({
+            "users": [
+                {"id": 1, "name": "Alice", "tags": ["admin", "moderator"]},
+                {"id": 2, "name": "Bob", "tags": ["user"]}
+            ]
+        }), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+
+        // Should detect the tag addition
+        assert_eq!(diff.len(), 1);
+        match &diff.changes[0] {
+            StateChange::Added { path, value } => {
+                assert_eq!(path.to_canonical_string(), "users[0].tags[1]");
+                assert_eq!(*value, json!("moderator"));
+            }
+            _ => panic!("Expected Added change for new tag"),
+        }
+    }
+
+    #[test]
+    fn evidence_unicode_in_keys_and_values() {
+        // Verify: Correctly handles Unicode in keys and values
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_unicode").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let left = store.create(&json!({
+            "用户": {"名字": "张三"}
+        })).unwrap();
+
+        let right = store.commit(&json!({
+            "用户": {"名字": "李四", "🚀": "rocket"}
+        }), left.state_id).unwrap();
+
+        let diff = store.diff(left.state_id, right.state_id).unwrap();
+
+        // Should have 2 changes: one Changed, one Added
+        assert_eq!(diff.len(), 2);
+
+        let paths: Vec<String> = diff.changes.iter()
+            .map(|c| c.path().to_canonical_string())
+            .collect();
+
+        assert!(paths.contains(&"用户.名字".to_string()));
+        assert!(paths.contains(&"用户.🚀".to_string()));
+    }
+
+    #[test]
+    fn evidence_all_operations_no_panic() {
+        // Verify: No panics on any valid operations
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("evidence_no_panic").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Create various states
+        let states = vec![
+            json!({}),
+            json!([]),
+            json!(null),
+            json!(0),
+            json!(false),
+            json!(""),
+            json!({"a": {"b": {"c": 1}}}),
+            json!([[[1]]])
+        ];
+
+        let mut revisions = Vec::new();
+        for state in &states {
+            if revisions.is_empty() {
+                revisions.push(store.create(state).unwrap().state_id);
+            } else {
+                revisions.push(store.commit(state, revisions[0]).unwrap().state_id);
+            }
+        }
+
+        // Try all pairwise diffs - none should panic
+        for (i, &rev_i) in revisions.iter().enumerate() {
+            for &rev_j in revisions.iter().skip(i) {
+                let _ = store.diff(rev_i, rev_j);
+            }
+        }
+    }
 }
+
 
