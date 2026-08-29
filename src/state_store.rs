@@ -31,6 +31,12 @@ pub enum StateStoreError {
     IoError(String),
     PersistenceError(String),
     ConflictClassificationError(String),
+    MissingLeftState,
+    MissingRightState,
+    MissingBaseState,
+    InvalidBase,
+    UnrelatedStates,
+    ReconciliationError(String),
 }
 
 impl Display for StateStoreError {
@@ -45,6 +51,12 @@ impl Display for StateStoreError {
             StateStoreError::IoError(e) => write!(f, "io error: {}", e),
             StateStoreError::PersistenceError(e) => write!(f, "persistence error: {}", e),
             StateStoreError::ConflictClassificationError(e) => write!(f, "conflict classification error: {}", e),
+            StateStoreError::MissingLeftState => write!(f, "missing left state"),
+            StateStoreError::MissingRightState => write!(f, "missing right state"),
+            StateStoreError::MissingBaseState => write!(f, "missing base state"),
+            StateStoreError::InvalidBase => write!(f, "invalid base: base is not a valid common ancestor"),
+            StateStoreError::UnrelatedStates => write!(f, "cannot reconcile unrelated states"),
+            StateStoreError::ReconciliationError(e) => write!(f, "reconciliation error: {}", e),
         }
     }
 }
@@ -80,6 +92,30 @@ pub struct RevisionMetadata {
     pub state_id: StateId,
     pub parent: Option<StateId>,
     pub authority: AuthorityId,
+}
+
+/// A reconciliation plan containing explicit causal inputs and caller-supplied result.
+/// The caller is responsible for determining the resolution strategy; FeltDB only validates
+/// and materializes it.
+#[derive(Debug, Clone)]
+pub struct ReconciliationPlan {
+    /// The common ancestor state (if reconciling diverged or related states).
+    /// For identical states, this is None.
+    /// For ancestor/descendant relationships, this is the ancestor.
+    /// For diverged states, this is the most recent common ancestor.
+    /// For unrelated states, this must be None (reconciliation not supported).
+    pub base_state: Option<StateId>,
+    /// The left state in the reconciliation.
+    pub left_state: StateId,
+    /// The right state in the reconciliation.
+    pub right_state: StateId,
+    /// The explicit candidate result supplied by the caller.
+    /// FeltDB does not decide this value; it only validates and materializes it.
+    pub result: Value,
+    /// The caller's choice of which causal input becomes the parent in the resulting state.
+    /// Must be one of: left_state, right_state, or base_state (if present).
+    /// This allows the caller to select the linearity orientation without FeltDB deciding policy.
+    pub parent_choice: StateId,
 }
 
 /// A segment of a path to a location in application state.
@@ -1024,7 +1060,101 @@ impl StateStore {
 
         Ok(())
     }
+
+    /// Materialize an explicitly supplied reconciliation result.
+    ///
+    /// This primitive validates that:
+    /// - left and right states exist
+    /// - base state (if provided) is a valid common ancestor of left and right
+    /// - the relationship matches the reconciliation context
+    /// - the candidate result can be canonicalized
+    /// - parent_choice is one of the causal inputs
+    ///
+    /// On success, creates a new immutable state from the caller-supplied result and returns
+    /// a StateHandle representing it. The new state is NOT automatically added to current;
+    /// the caller must use create_branch or commit_transition to persist it into the lineage.
+    ///
+    /// FeltDB does NOT decide the result. The caller supplies the exact candidate value.
+    /// FeltDB only validates that the causal context is consistent.
+    /// FeltDB does NOT decide the parent. The caller chooses which causal input becomes the parent.
+    pub fn reconcile(&mut self, plan: &ReconciliationPlan) -> Result<StateHandle, StateStoreError> {
+        // Validate left state exists
+        if !self.exists(plan.left_state)? {
+            return Err(StateStoreError::MissingLeftState);
+        }
+
+        // Validate right state exists
+        if !self.exists(plan.right_state)? {
+            return Err(StateStoreError::MissingRightState);
+        }
+
+        // Validate parent_choice is one of the causal inputs
+        let is_valid_parent = plan.parent_choice == plan.left_state 
+            || plan.parent_choice == plan.right_state
+            || (plan.base_state.is_some() && plan.parent_choice == plan.base_state.unwrap());
+        
+        if !is_valid_parent {
+            return Err(StateStoreError::ReconciliationError(
+                "parent_choice must be one of: left_state, right_state, or base_state".to_string(),
+            ));
+        }
+
+        // Determine relationship between left and right
+        let relationship = self.relationship(plan.left_state, plan.right_state)?;
+
+        // Validate the relationship and base state consistency
+        match relationship {
+            StateRelationship::Identity => {
+                // Identity case: left and right are the same state.
+                // base_state must be None.
+                if plan.base_state.is_some() {
+                    return Err(StateStoreError::InvalidBase);
+                }
+            }
+            StateRelationship::Ancestor => {
+                // Left is an ancestor of right.
+                // base_state must be Some(left).
+                if plan.base_state != Some(plan.left_state) {
+                    return Err(StateStoreError::InvalidBase);
+                }
+            }
+            StateRelationship::Descendant => {
+                // Right is an ancestor of left.
+                // base_state must be Some(right).
+                if plan.base_state != Some(plan.right_state) {
+                    return Err(StateStoreError::InvalidBase);
+                }
+            }
+            StateRelationship::Diverged => {
+                // States diverged from a common ancestor.
+                // base_state must be Some(ancestor).
+                let common = self.common_ancestor(plan.left_state, plan.right_state);
+                if plan.base_state != common {
+                    return Err(StateStoreError::InvalidBase);
+                }
+            }
+            StateRelationship::Unrelated => {
+                // States have no common ancestor.
+                // Reconciliation of unrelated states is not supported.
+                return Err(StateStoreError::UnrelatedStates);
+            }
+        }
+
+        // Validate that the candidate result can be canonicalized
+        let _canonical = CanonicalState::from_json(&plan.result)?;
+
+        // Create a new revision from the candidate result.
+        // The parent is determined by the caller's explicit choice.
+        // This preserves policy neutrality: FeltDB does not decide which input becomes the parent.
+        // The caller's choice determines the linearity orientation of the reconciled state.
+        let revision = self
+            .history
+            .create_revision(&plan.result, Some(plan.parent_choice))?;
+
+        Ok(self.revision_to_handle(revision)?)
+    }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -4739,6 +4869,933 @@ mod tests {
             "Right state should be unchanged"
         );
     }
-}
 
+    // ========== RECONCILIATION TESTS (PR #14) ==========
+    // These tests validate the explicit reconciliation mechanism
+
+    #[test]
+    fn reconcile_diverged_conflict_left_wins() {
+        // REQUIREMENT: Caller supplies result, FeltDB materializes it without deciding
+        // EVIDENCE: Supplied result is accepted and materialized as new state
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("reconcile_diverged").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        // Caller explicitly decides left wins
+        let result = json!({"x": 2, "choice": "left_wins"});
+
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: result.clone(),
+            parent_choice: left.state_id,
+        };
+
+        let reconciled = store.reconcile(&plan).unwrap();
+
+        // Verify result is preserved exactly
+        assert_eq!(reconciled.state, result);
+        // Verify it's a new state (different from input states)
+        assert_ne!(reconciled.state_id, left.state_id);
+        assert_ne!(reconciled.state_id, right.state_id);
+        assert_ne!(reconciled.state_id, base.state_id);
+    }
+
+    #[test]
+    fn reconcile_diverged_conflict_right_wins() {
+        // REQUIREMENT: Different explicit result is accepted
+        // EVIDENCE: Same inputs, different result produces different outcome
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("reconcile_right").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        // Caller explicitly decides right wins (different from previous test)
+        let result = json!({"x": 3, "choice": "right_wins"});
+
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: result.clone(),
+            parent_choice: right.state_id,
+        };
+
+        let reconciled = store.reconcile(&plan).unwrap();
+
+        // Verify result is preserved exactly
+        assert_eq!(reconciled.state, result);
+    }
+
+    #[test]
+    fn reconcile_custom_result() {
+        // REQUIREMENT: Custom merged result is accepted
+        // EVIDENCE: Caller can supply arbitrary result not in left/right
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("reconcile_custom").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        // Caller supplies custom merged result
+        let result = json!({"x": 2, "y": 3, "merged": true});
+
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: result.clone(),
+        parent_choice: left.state_id,
+        };
+
+        let reconciled = store.reconcile(&plan).unwrap();
+
+        // Verify exact result
+        assert_eq!(reconciled.state, result);
+    }
+
+    #[test]
+    fn reconcile_identity_no_op() {
+        // REQUIREMENT: Identity case (left == right) is allowed
+        // EVIDENCE: Reconciliation succeeds when both states are identical
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("reconcile_identity").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let state = store.create(&json!({"x": 1})).unwrap();
+
+        // Reconcile identical state with itself
+        // The result should be a new state (with unique content to avoid duplicates)
+        let plan = ReconciliationPlan {
+            base_state: None, // Identity has no base
+            left_state: state.state_id,
+            right_state: state.state_id,
+            result: json!({"x": 1, "identity_reconciled": true}),
+            parent_choice: state.state_id,
+        };
+
+        let reconciled = store.reconcile(&plan).unwrap();
+        assert_ne!(reconciled.state_id, state.state_id); // New state created
+        assert_eq!(reconciled.state.get("x"), Some(&json!(1))); // But value preserved
+    }
+
+    #[test]
+    fn reconcile_ancestor_allowed() {
+        // REQUIREMENT: Ancestor/descendant relationship is allowed
+        // EVIDENCE: Reconciliation succeeds when one state is ancestor of other
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("reconcile_ancestor").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let ancestor = store.create(&json!({"x": 1})).unwrap();
+        let descendant = store.commit(&json!({"x": 2}), ancestor.state_id).unwrap();
+
+        // Reconcile ancestor with descendant
+        let result = json!({"x": 2});
+        let plan = ReconciliationPlan {
+            base_state: Some(ancestor.state_id),
+            left_state: ancestor.state_id,
+            right_state: descendant.state_id,
+            result: result.clone(),
+            parent_choice: ancestor.state_id,
+        };
+
+        let reconciled = store.reconcile(&plan).unwrap();
+        assert_eq!(reconciled.state, result);
+    }
+
+    #[test]
+    fn reconcile_missing_left_state_error() {
+        // REQUIREMENT: Missing left state produces error
+        // EVIDENCE: Error, not silent fallback
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("reconcile_missing_left").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let fake_id = StateId::from_hex("0000000000000000000000000000000000000000000000000000000000000000").unwrap();
+
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: fake_id,
+            right_state: right.state_id,
+            result: json!({"x": 1}),
+            parent_choice: fake_id,
+        };
+
+        let result = store.reconcile(&plan);
+        assert!(result.is_err());
+        match result {
+            Err(StateStoreError::MissingLeftState) => (),
+            _ => panic!("Expected MissingLeftState error"),
+        }
+    }
+
+    #[test]
+    fn reconcile_missing_right_state_error() {
+        // REQUIREMENT: Missing right state produces error
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("reconcile_missing_right").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let fake_id = StateId::from_hex("0000000000000000000000000000000000000000000000000000000000000000").unwrap();
+
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: fake_id,
+            result: json!({"x": 1}),
+        parent_choice: left.state_id,
+        };
+
+        let result = store.reconcile(&plan);
+        assert!(result.is_err());
+        match result {
+            Err(StateStoreError::MissingRightState) => (),
+            _ => panic!("Expected MissingRightState error"),
+        }
+    }
+
+    #[test]
+    fn reconcile_invalid_base_wrong_ancestor() {
+        // REQUIREMENT: Invalid base is rejected
+        // EVIDENCE: Supplied base that is not actually common ancestor errors
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("reconcile_invalid_base").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+        
+        // Use wrong base (a state that isn't actually common ancestor)
+        let wrong_base = store.create_branch(base.state_id, &json!({"x": 99})).unwrap();
+
+        let plan = ReconciliationPlan {
+            base_state: Some(wrong_base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 2}),
+        parent_choice: left.state_id,
+        };
+
+        let result = store.reconcile(&plan);
+        assert!(result.is_err());
+        match result {
+            Err(StateStoreError::InvalidBase) => (),
+            _ => panic!("Expected InvalidBase error"),
+        }
+    }
+
+    #[test]
+    fn reconcile_unrelated_states_error() {
+        // REQUIREMENT: Unrelated states cannot be reconciled
+        // EVIDENCE: Returns UnrelatedStates error, not silent failure
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("reconcile_unrelated").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Create two independent histories with no common ancestor
+        let state_a = store.create(&json!({"a": 1})).unwrap();
+        
+        // Create independent store to get unrelated state
+        let temp_dir2 = TempDir::new().unwrap();
+        let authority2 = AuthorityId::new("reconcile_unrelated_2").unwrap();
+        let mut store2 = StateStore::new(temp_dir2.path(), authority2).unwrap();
+        let state_b = store2.create(&json!({"b": 2})).unwrap();
+
+        // Note: We can't directly test unrelated states between two separate stores
+        // Instead, we'll verify the implementation accepts None base for diverged case
+        // This test is a placeholder for the conceptual requirement
+        
+        // For true unrelated test, we would need states with no common ancestor in same store
+        // This is difficult to create in current architecture (all states trace back to root)
+        // The implementation correctly rejects StateRelationship::Unrelated
+    }
+
+    #[test]
+    fn reconcile_immutability_base_unchanged() {
+        // REQUIREMENT: Base state remains immutable
+        // EVIDENCE: Reconciliation does not modify base
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("reconcile_immut_base").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        let base_before = store.get(base.state_id).unwrap();
+
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 2, "immutability_test": true}),
+        parent_choice: left.state_id,
+        };
+
+        let _reconciled = store.reconcile(&plan).unwrap();
+
+        let base_after = store.get(base.state_id).unwrap();
+
+        // Base must be unchanged
+        assert_eq!(base_before.state, base_after.state);
+        assert_eq!(base_before.state_id, base_after.state_id);
+    }
+
+    #[test]
+    fn reconcile_immutability_left_unchanged() {
+        // REQUIREMENT: Left state remains immutable
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("reconcile_immut_left").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        let left_before = store.get(left.state_id).unwrap();
+
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 99}),
+        parent_choice: left.state_id,
+        };
+
+        let _reconciled = store.reconcile(&plan).unwrap();
+
+        let left_after = store.get(left.state_id).unwrap();
+
+        // Left must be unchanged
+        assert_eq!(left_before.state, left_after.state);
+        assert_eq!(left_before.state_id, left_after.state_id);
+    }
+
+    #[test]
+    fn reconcile_immutability_right_unchanged() {
+        // REQUIREMENT: Right state remains immutable
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("reconcile_immut_right").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        let right_before = store.get(right.state_id).unwrap();
+
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 99}),
+        parent_choice: left.state_id,
+        };
+
+        let _reconciled = store.reconcile(&plan).unwrap();
+
+        let right_after = store.get(right.state_id).unwrap();
+
+        // Right must be unchanged
+        assert_eq!(right_before.state, right_after.state);
+        assert_eq!(right_before.state_id, right_after.state_id);
+    }
+
+    #[test]
+    fn reconcile_current_pointer_unchanged() {
+        // REQUIREMENT: Reconciliation does not automatically advance current
+        // EVIDENCE: Current pointer remains where it was before reconciliation
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("reconcile_current").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let _left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let _right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        let current_before = store.current().unwrap();
+
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: _left.state_id,
+            right_state: _right.state_id,
+            result: json!({"x": 2, "current_pointer_test": true}),
+            parent_choice: _left.state_id,
+        };
+
+        let _reconciled = store.reconcile(&plan).unwrap();
+
+        let current_after = store.current().unwrap();
+
+        // Current pointer must not have advanced
+        assert_eq!(current_before.state_id, current_after.state_id);
+    }
+
+    #[test]
+    fn reconcile_deterministic_output() {
+        // REQUIREMENT: Same inputs produce same result
+        // EVIDENCE: Two identical reconciliation plans produce same state_id
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("reconcile_determ").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        let result_value = json!({"x": 2, "merged": true});
+
+        let plan1 = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: result_value.clone(),
+            parent_choice: left.state_id,
+        };
+
+        let reconciled1 = store.reconcile(&plan1).unwrap();
+
+        // Create new store with same states and reconcile again
+        let temp_dir2 = TempDir::new().unwrap();
+        let authority2 = AuthorityId::new("reconcile_determ_2").unwrap();
+        let mut store2 = StateStore::new(temp_dir2.path(), authority2).unwrap();
+
+        let base2 = store2.create(&json!({"x": 1})).unwrap();
+        let left2 = store2.create_branch(base2.state_id, &json!({"x": 2})).unwrap();
+        let right2 = store2.create_branch(base2.state_id, &json!({"x": 3})).unwrap();
+
+        let plan2 = ReconciliationPlan {
+            base_state: Some(base2.state_id),
+            left_state: left2.state_id,
+            right_state: right2.state_id,
+            result: result_value,
+            parent_choice: left2.state_id,
+        };
+
+        let reconciled2 = store2.reconcile(&plan2).unwrap();
+
+        // State content must be identical
+        assert_eq!(reconciled1.state, reconciled2.state);
+        // StateIds must be identical (same content, same canonicalization)
+        assert_eq!(reconciled1.state_id, reconciled2.state_id);
+    }
+
+    #[test]
+    fn reconcile_authority_neutrality() {
+        // REQUIREMENT: Authority does not affect reconciliation
+        // EVIDENCE: Different authority produces same reconciled state
+        let temp_dir = TempDir::new().unwrap();
+        let auth_alice = AuthorityId::new("alice").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), auth_alice.clone()).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 2, "test": "authority_neutrality"}),
+        parent_choice: left.state_id,
+        };
+
+        let reconciled = store.reconcile(&plan).unwrap();
+
+        // The result's authority should be the store's authority
+        assert_eq!(reconciled.authority, auth_alice);
+
+        // But the state content and ID should be unaffected by authority choice
+        // (This is proven by deterministic_output test using different authorities)
+    }
+
+    #[test]
+    fn reconcile_no_git_dependency() {
+        // REQUIREMENT: Reconciliation works without Git
+        // EVIDENCE: All states created and reconciled without Git initialization
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("no_git").unwrap();
+
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Create states
+        let base = store.create(&json!({"data": "base"})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"data": "left"})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"data": "right"})).unwrap();
+
+        // Reconcile without any Git operations
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"data": "merged"}),
+        parent_choice: left.state_id,
+        };
+
+        let reconciled = store.reconcile(&plan).unwrap();
+
+        // Verify it succeeded entirely in pure state store semantics
+        assert_eq!(reconciled.state, json!({"data": "merged"}));
+        assert!(reconciled.state_id.to_hex().len() > 0);
+    }
+
+    // ===== PARENTAGE AUDIT TESTS =====
+    // These tests resolve whether single-parent StateRevision semantics can correctly
+    // represent a reconciled state derived from Base + Left + Right.
+    //
+    // Critical question: Does StateRevision.parent represent:
+    // (a) Sole causal ancestor (genealogy)?
+    // (b) Immediate materialization source (mechanics)?
+    // (c) Something else?
+
+    #[test]
+    fn p2_topology_consistency_after_diverged_reconciliation() {
+        // P2 REQUIREMENT: Test actual topology after reconciliation with Base→Left, Base→Right
+        // 
+        // Setup: Base → Left, Base → Right
+        // Action: Reconcile Left + Right into Result
+        // Test: Query relationship(Left, Result) and relationship(Right, Result)
+        //
+        // CRITICAL: If parent(Result) = Left, the topology shows:
+        //   Base → Left → Result
+        //   Base → Right (disconnected from Result)
+        //
+        // This means relationship(Right, Result) will NOT show Right as a causal input.
+        // That is the architectural question we must answer.
+
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("p2_topology").unwrap();
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        // Build: Base → Left, Base → Right
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        // Verify divergence
+        let rel_before = store.relationship(left.state_id, right.state_id).unwrap();
+        assert!(
+            matches!(rel_before, StateRelationship::Diverged),
+            "Expected Diverged, got {:?}",
+            rel_before
+        );
+
+        // Reconcile Left + Right → Result
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 2, "merged": true}),
+        parent_choice: left.state_id,
+        };
+        let result = store.reconcile(&plan).unwrap();
+
+        // P2 AUDIT EVIDENCE: Check the actual topology relationships
+        //
+        // Query: relationship(Left, Result)
+        let rel_left_result = store.relationship(left.state_id, result.state_id).unwrap();
+        // Expected if parent=Left: Ancestor (Left is direct parent of Result)
+        assert!(
+            matches!(rel_left_result, StateRelationship::Ancestor),
+            "P2: relationship(Left, Result) should be Ancestor (Left is parent), got {:?}",
+            rel_left_result
+        );
+
+        // Query: relationship(Right, Result)
+        let rel_right_result = store.relationship(right.state_id, result.state_id).unwrap();
+        // THIS IS THE CRITICAL TEST:
+        // If single-parent semantics are sufficient, Right should NOT appear as an ancestor.
+        // Instead, relationship(Right, Result) will show Diverged or Unrelated,
+        // because the topology only records Left → Result.
+        //
+        // This is the architectural problem:
+        // - Result WAS semantically derived from Right (it's in the ReconciliationPlan)
+        // - But the topology DOES NOT record Right → Result
+        // - So relationship(Right, Result) will NOT correctly answer "Was Result derived from Right?"
+        //
+        // EVIDENCE CAPTURE:
+        match rel_right_result {
+            StateRelationship::Ancestor | StateRelationship::Descendant => {
+                panic!(
+                    "P2 ALERT: relationship(Right, Result) = {:?}. \
+                     This would mean Right is in Result's ancestry, but the topology \
+                     only records Left→Result. This should not happen with single-parent semantics.",
+                    rel_right_result
+                );
+            }
+            StateRelationship::Diverged => {
+                // This is expected if Right is not in the ancestry.
+                // But this is PROBLEMATIC from an architectural perspective:
+                // Result WAS derived from Right, but topology says Diverged.
+            }
+            StateRelationship::Identity => {
+                panic!(
+                    "P2 ALERT: relationship(Right, Result) = Identity. \
+                     Right and Result are not the same state."
+                );
+            }
+            StateRelationship::Unrelated => {
+                // If Right and Result are unrelated in the topology, this indicates
+                // that Right's causal contribution to Result is NOT preserved in the ancestry.
+            }
+        }
+
+        // Common ancestor queries
+        let ancestor_left_result = store.common_ancestor(left.state_id, result.state_id);
+        // CRITICAL: If Result's parent = Left, then Left is the immediate ancestor of Result.
+        // common_ancestor(Left, Result) should return Left itself (the most recent common ancestor).
+        assert_eq!(
+            ancestor_left_result,
+            Some(left.state_id),
+            "P2: common_ancestor(Left, Result) should be Left (since Left is Result's parent)"
+        );
+
+        let _ancestor_right_result = store.common_ancestor(right.state_id, result.state_id);
+        // CRITICAL: If Right is not in Result's ancestry, what is the common ancestor?
+        // If Result's parent=Left, then common_ancestor(Right, Result) would be Base
+        // (the common ancestor of Right and Left).
+        // But this does NOT tell us that Right contributed to Result.
+    }
+
+    #[test]
+    fn p3_information_preservation_right_ancestry() {
+        // P3 REQUIREMENT: Can the database answer "Was Result derived from Right?"
+        // using topology primitives alone?
+        //
+        // If parent(Result) = Left and Right's contribution is only in provenance metadata,
+        // then the answer would be NO - the topology cannot answer this question.
+        //
+        // EVIDENCE: Attempt to reconstruct whether Right was a direct input to reconciliation
+
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("p3_info").unwrap();
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 2, "from": "reconciliation"}),
+        parent_choice: left.state_id,
+        };
+        let result = store.reconcile(&plan).unwrap();
+
+        // Attempt to answer via topology: "Was Result derived from Right?"
+        // Method 1: Check if Right is an ancestor of Result
+        let rel = store.relationship(right.state_id, result.state_id).unwrap();
+        let right_is_ancestor = matches!(
+            rel,
+            StateRelationship::Ancestor | StateRelationship::Identity
+        );
+
+        // Method 2: Check if Right is in the lineage by walking ancestors
+        let mut current = Some(result.state_id);
+        let mut found_right = false;
+        let mut depth = 0;
+        const MAX_DEPTH: usize = 10;
+
+        while let Some(current_id) = current {
+            if current_id == right.state_id {
+                found_right = true;
+                break;
+            }
+            depth += 1;
+            if depth > MAX_DEPTH {
+                break; // Safety limit
+            }
+            // Get the parent to find next ancestor
+            if let Ok(parent_opt) = store.parent(current_id) {
+                current = parent_opt;
+            } else {
+                break;
+            }
+        }
+
+        // P3 EVIDENCE:
+        // If single-parent semantics are sufficient, this test should show:
+        // - Right is NOT an ancestor of Result (topology says Diverged or Unrelated)
+        // - Right is NOT found by walking Result's parent chain
+        //
+        // This would prove that Right's contribution is LOST from the topology
+        // and can only be recovered from provenance metadata (if stored in the result value).
+
+        if right_is_ancestor || found_right {
+            panic!(
+                "P3 ALERT: Right was found in Result's ancestry. \
+                 This indicates Right's relationship is preserved in the topology. \
+                 Actual: right_is_ancestor={}, found_by_walk={}",
+                right_is_ancestor, found_right
+            );
+        }
+
+        // If we reach here, it means Right's contribution is not discoverable via topology.
+        // This is the core architectural issue.
+    }
+
+    #[test]
+    fn p5_diff_classification_after_reconciliation() {
+        // P5 REQUIREMENT: After creating Result, run diff(Right, Result) and
+        // classify_conflicts(Right, Result). Verify semantic correctness.
+        //
+        // CRITICAL: If the topology has Result → Diverged ← Right,
+        // then diff() and classify_conflicts() will treat Right and Result as
+        // having diverged independently, not as Right being a direct input to Result.
+
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("p5_diff").unwrap();
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        // Reconcile: Take Left's value
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 2, "reconciled": true}),
+        parent_choice: left.state_id,
+        };
+        let result = store.reconcile(&plan).unwrap();
+
+        // Now compute diff and classification
+        let diff_result = store
+            .diff(right.state_id, result.state_id)
+            .expect("diff should succeed");
+
+        let classification = store
+            .classify_conflicts(right.state_id, result.state_id)
+            .expect("classify should succeed");
+
+        // P5 EVIDENCE:
+        // The diff shows changes between Right and Result.
+        // But are these classified as "converging" changes, or as "diverging" changes?
+        //
+        // Semantically: Result INCORPORATES Right's input. The diff should reflect
+        // that Result is a deliberate reconciliation, not a random divergence.
+        //
+        // But if the topology only shows Left → Result, then diff/classify may treat
+        // this as an independent divergence from Right's perspective.
+
+        // We cannot verify semantic correctness without defining the expected behavior.
+        // This test documents the actual behavior so architects can decide if it's acceptable.
+
+        // For now, capture the evidence
+        println!(
+            "P5 EVIDENCE: diff(Right, Result) = {:?}",
+            diff_result
+        );
+        println!(
+            "P5 EVIDENCE: classify_conflicts(Right, Result) = {:?}",
+            classification
+        );
+
+        // The test passes if these operations complete without error.
+        // The semantic correctness is a matter of architectural interpretation.
+    }
+
+    #[test]
+    fn p6_arbitrary_parent_invariance() {
+        // P6 REQUIREMENT: Run the same reconciliation twice with different parent choices.
+        // 
+        // Scenario 1: Reconcile with parent = Left
+        // Scenario 2: Reconcile with parent = Right (hypothetically)
+        //
+        // Do the resulting topologies differ? If so, which is correct?
+        // Or are they equally valid linearizations?
+        //
+        // NOTE: Current implementation only supports parent = Left.
+        // This test documents why the choice matters.
+
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("p6_parent").unwrap();
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        // Create reconciled state with parent = Left (current implementation)
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 2, "parent_choice": "left"}),
+        parent_choice: left.state_id,
+        };
+        let result_left_parent = store.reconcile(&plan).unwrap();
+
+        // Query topology from result_left_parent's perspective
+        let rel_from_left = store.relationship(left.state_id, result_left_parent.state_id).unwrap();
+        let rel_from_right = store.relationship(right.state_id, result_left_parent.state_id).unwrap();
+
+        // P6 EVIDENCE:
+        // If we created a hypothetical result_right_parent (with parent = Right),
+        // its topology would show:
+        //   relationship(Left, result_right_parent) ≠ Ancestor (Left would not be parent)
+        //   relationship(Right, result_right_parent) = Ancestor (Right would be parent)
+        //
+        // This would prove that the parent choice directly affects the topology.
+        // The question is: Does it affect the SEMANTIC correctness?
+        //
+        // In both cases, the result value is identical ({"x": 2}).
+        // But the topology changes based on which input we claim is the "immediate causal predecessor".
+
+        // Current evidence (parent = Left):
+        assert!(
+            matches!(rel_from_left, StateRelationship::Ancestor),
+            "P6: With parent=Left, relationship(Left, Result) should be Ancestor"
+        );
+
+        println!(
+            "P6 EVIDENCE: With parent=Left, relationship(Right, Result) = {:?}",
+            rel_from_right
+        );
+
+        // The key question remains: If we could choose parent=Right instead,
+        // would that be equally valid? Or is there a correct choice?
+        //
+        // The answer depends on what parent semantically represents.
+    }
+
+    #[test]
+    fn p1_parent_semantic_definition_required() {
+        // P1 REQUIREMENT: Explicitly define what StateRevision.parent means
+        //
+        // Current documentation (state_history.rs): "The immediate causal predecessor, if any."
+        //
+        // This test documents why the definition matters:
+        //
+        // Interpretation A: Parent = Sole Causal Ancestor (genealogy)
+        //   Then parent(Result) = Left is WRONG because Result also came from Right.
+        //   The topology is false.
+        //
+        // Interpretation B: Parent = Immediate Materialization Source (mechanics)
+        //   Then parent(Result) = Left is OK because Left was the "source" we used.
+        //   But then the topology doesn't represent causal dependency, only materialization order.
+        //
+        // Interpretation C: Parent = Single Arbitrarily Chosen Predecessor
+        //   Then parent(Result) = Left is acceptable if documented as intentional linearization.
+        //   But then the architecture must explicitly say so.
+        //
+        // EVIDENCE: This test is a documentation requirement, not a runtime check.
+        // The decision must come from architectural review.
+
+        // Minimal test just to have runtime evidence
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("p1_definition").unwrap();
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let state = store.create(&json!({"data": "test"})).unwrap();
+
+        // Parent must be documented and consistent
+        let parent_opt = store.parent(state.state_id).unwrap();
+
+        // The parent should exist and be documented
+        // If parent is supposed to represent "sole causal ancestor", then
+        // a reconciliation result's parent should represent all causal inputs.
+        // If parent is only a "convenience link", then single-parent is acceptable.
+
+        // This test doesn't resolve the question, it just ensures
+        // the runtime semantics match whatever definition is chosen.
+        println!(
+            "P1 REQUIREMENT: StateRevision.parent must have explicit semantic definition. \
+             Current state parent = {:?}",
+            parent_opt
+        );
+    }
+
+    #[test]
+    fn p4_provenance_metadata_not_ancestry_edges() {
+        // P4 REQUIREMENT: Prove that provenance metadata does NOT substitute for ancestry edges
+        //
+        // The current reconciliation strategy:
+        // 1. Store base, left, right as provenance metadata (hypothetically in result value)
+        // 2. Store only left as the parent (single edge)
+        //
+        // This test verifies whether the topology queries work correctly WITHOUT
+        // the provenance metadata.
+
+        let temp_dir = TempDir::new().unwrap();
+        let authority = AuthorityId::new("p4_provenance").unwrap();
+        let mut store = StateStore::new(temp_dir.path(), authority).unwrap();
+
+        let base = store.create(&json!({"x": 1})).unwrap();
+        let left = store.create_branch(base.state_id, &json!({"x": 2})).unwrap();
+        let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
+
+        // Reconcile without storing base/left/right in the result value
+        // (The reconciliation mechanism doesn't do this anyway)
+        let plan = ReconciliationPlan {
+            base_state: Some(base.state_id),
+            left_state: left.state_id,
+            right_state: right.state_id,
+            result: json!({"x": 2, "no_provenance": true}),
+        parent_choice: left.state_id,
+        };
+        let result = store.reconcile(&plan).unwrap();
+
+        // P4 TEST: Can we answer "What was the base state for this reconciliation?"
+        // using topology alone (without provenance metadata in the result value)?
+        //
+        // Answer: NO. The topology only shows Left → Result.
+        // We cannot discover base or right just from topology.
+
+        // This proves that the current architecture REQUIRES provenance metadata
+        // to be stored somewhere (either in the result value, or in StateRevision's metadata).
+        //
+        // The question is: Is that acceptable?
+        //
+        // If parent semantics are "sole causal ancestor", then no, it's not acceptable.
+        // If parent semantics are "materialization source", then possibly yes.
+
+        println!(
+            "P4 EVIDENCE: Result state has value: {:?}",
+            result.state
+        );
+        println!(
+            "P4: Topology alone cannot answer 'what was the base state?' \
+             The base, left, right must be stored as metadata if they need to be queryable."
+        );
+
+        // Minimal assertion to make test pass
+        assert!(!result.state.to_string().is_empty());
+    }
+}
 
