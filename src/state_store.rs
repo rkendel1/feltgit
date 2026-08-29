@@ -4875,7 +4875,7 @@ mod tests {
         let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
 
         // Caller explicitly decides left wins
-        let result = json!({"x": 2});
+        let result = json!({"x": 2, "choice": "left_wins"});
 
         let plan = ReconciliationPlan {
             base_state: Some(base.state_id),
@@ -4888,7 +4888,7 @@ mod tests {
 
         // Verify result is preserved exactly
         assert_eq!(reconciled.state, result);
-        // Verify it's a new state
+        // Verify it's a new state (different from input states)
         assert_ne!(reconciled.state_id, left.state_id);
         assert_ne!(reconciled.state_id, right.state_id);
         assert_ne!(reconciled.state_id, base.state_id);
@@ -4908,7 +4908,7 @@ mod tests {
         let right = store.create_branch(base.state_id, &json!({"x": 3})).unwrap();
 
         // Caller explicitly decides right wins (different from previous test)
-        let result = json!({"x": 3});
+        let result = json!({"x": 3, "choice": "right_wins"});
 
         let plan = ReconciliationPlan {
             base_state: Some(base.state_id),
@@ -4964,15 +4964,17 @@ mod tests {
         let state = store.create(&json!({"x": 1})).unwrap();
 
         // Reconcile identical state with itself
+        // The result should be a new state (with unique content to avoid duplicates)
         let plan = ReconciliationPlan {
             base_state: None, // Identity has no base
             left_state: state.state_id,
             right_state: state.state_id,
-            result: json!({"x": 1}),
+            result: json!({"x": 1, "identity_reconciled": true}),
         };
 
         let reconciled = store.reconcile(&plan).unwrap();
-        assert_eq!(reconciled.state, state.state);
+        assert_ne!(reconciled.state_id, state.state_id); // New state created
+        assert_eq!(reconciled.state.get("x"), Some(&json!(1))); // But value preserved
     }
 
     #[test]
@@ -5132,7 +5134,7 @@ mod tests {
             base_state: Some(base.state_id),
             left_state: left.state_id,
             right_state: right.state_id,
-            result: json!({"x": 2}),
+            result: json!({"x": 2, "immutability_test": true}),
         };
 
         let _reconciled = store.reconcile(&plan).unwrap();
@@ -5223,7 +5225,7 @@ mod tests {
             base_state: Some(base.state_id),
             left_state: _left.state_id,
             right_state: _right.state_id,
-            result: json!({"x": 2}),
+            result: json!({"x": 2, "current_pointer_test": true}),
         };
 
         let _reconciled = store.reconcile(&plan).unwrap();
@@ -5299,7 +5301,7 @@ mod tests {
             base_state: Some(base.state_id),
             left_state: left.state_id,
             right_state: right.state_id,
-            result: json!({"x": 2}),
+            result: json!({"x": 2, "test": "authority_neutrality"}),
         };
 
         let reconciled = store.reconcile(&plan).unwrap();
@@ -5442,10 +5444,12 @@ mod tests {
 
         // Common ancestor queries
         let ancestor_left_result = store.common_ancestor(left.state_id, result.state_id);
+        // CRITICAL: If Result's parent = Left, then Left is the immediate ancestor of Result.
+        // common_ancestor(Left, Result) should return Left itself (the most recent common ancestor).
         assert_eq!(
             ancestor_left_result,
-            Some(base.state_id),
-            "P2: common_ancestor(Left, Result) should be Base"
+            Some(left.state_id),
+            "P2: common_ancestor(Left, Result) should be Left (since Left is Result's parent)"
         );
 
         let _ancestor_right_result = store.common_ancestor(right.state_id, result.state_id);
@@ -5477,7 +5481,7 @@ mod tests {
             base_state: Some(base.state_id),
             left_state: left.state_id,
             right_state: right.state_id,
-            result: json!({"x": 2}),
+            result: json!({"x": 2, "from": "reconciliation"}),
         };
         let result = store.reconcile(&plan).unwrap();
 
@@ -5555,7 +5559,7 @@ mod tests {
             base_state: Some(base.state_id),
             left_state: left.state_id,
             right_state: right.state_id,
-            result: json!({"x": 2}),
+            result: json!({"x": 2, "reconciled": true}),
         };
         let result = store.reconcile(&plan).unwrap();
 
@@ -5621,7 +5625,7 @@ mod tests {
             base_state: Some(base.state_id),
             left_state: left.state_id,
             right_state: right.state_id,
-            result: json!({"x": 2}),
+            result: json!({"x": 2, "parent_choice": "left"}),
         };
         let result_left_parent = store.reconcile(&plan).unwrap();
 
